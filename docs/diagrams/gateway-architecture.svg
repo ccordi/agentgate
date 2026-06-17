@@ -1,0 +1,57 @@
+<svg viewBox="0 0 880 530" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#444"/>
+    </marker>
+  </defs>
+
+  <!-- column labels -->
+  <text x="170" y="28" font-size="13" fill="#666" text-anchor="middle">trusted</text>
+  <text x="655" y="28" font-size="13" fill="#666" text-anchor="middle">untrusted</text>
+
+  <!-- user turn box -->
+  <rect x="60" y="45" width="220" height="60" rx="6" fill="#fff" stroke="#444" stroke-width="1.5"/>
+  <text x="170" y="80" font-size="14" text-anchor="middle" fill="#222">user turn</text>
+  <text x="10" y="80" font-size="12" fill="#666" text-anchor="start">operator →</text>
+
+  <!-- tool/retrieval output box -->
+  <rect x="540" y="45" width="230" height="70" rx="6" fill="#fff" stroke="#444" stroke-width="1.5" stroke-dasharray="5 3"/>
+  <text x="655" y="73" font-size="14" text-anchor="middle" fill="#222">tool / retrieval</text>
+  <text x="655" y="91" font-size="14" text-anchor="middle" fill="#222">output</text>
+  <text x="780" y="68" font-size="12" fill="#666" text-anchor="start">← web, email,</text>
+  <text x="780" y="86" font-size="12" fill="#666" text-anchor="start">docs, tools</text>
+
+  <!-- agent model loop box -->
+  <rect x="340" y="130" width="180" height="70" rx="6" fill="#fff" stroke="#444" stroke-width="1.5"/>
+  <text x="430" y="160" font-size="14" text-anchor="middle" fill="#222">agent</text>
+  <text x="430" y="180" font-size="14" text-anchor="middle" fill="#222">model loop</text>
+
+  <!-- inputs feed the agent's context -->
+  <line x1="170" y1="107" x2="368" y2="127" stroke="#444" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="655" y1="117" x2="492" y2="127" stroke="#444" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <!-- the agent's model calls pass through the gateway -->
+  <line x1="430" y1="200" x2="430" y2="256" stroke="#444" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="446" y="232" font-size="12" fill="#666" text-anchor="start">model call</text>
+
+  <!-- gateway box -->
+  <rect x="60" y="260" width="760" height="150" rx="8" fill="#f0f6ff" stroke="#1f6feb" stroke-width="2.5"/>
+  <text x="440" y="292" font-size="18" font-weight="bold" text-anchor="middle" fill="#1f3a5f">Agent Safety Gateway</text>
+  <text x="440" y="314" font-size="12" text-anchor="middle" fill="#555">(reverse proxy, OpenAI / Anthropic wire format)</text>
+
+  <text x="440" y="345" font-size="13" text-anchor="middle" fill="#222">▸ scan untrusted content for injection</text>
+  <text x="440" y="369" font-size="13" text-anchor="middle" fill="#222">▸ route sensitive content to an on-device model</text>
+  <text x="440" y="393" font-size="13" text-anchor="middle" fill="#222">▸ redact secrets before anything leaves the host</text>
+
+  <!-- arrows down to destinations -->
+  <line x1="260" y1="410" x2="260" y2="458" stroke="#444" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="610" y1="410" x2="610" y2="458" stroke="#444" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- destination boxes -->
+  <rect x="130" y="460" width="260" height="55" rx="6" fill="#fff" stroke="#444" stroke-width="1.5"/>
+  <text x="260" y="482" font-size="14" text-anchor="middle" fill="#222">cloud LLM API</text>
+  <text x="260" y="501" font-size="12" text-anchor="middle" fill="#666">(redacted)</text>
+
+  <rect x="480" y="460" width="260" height="55" rx="6" fill="#fff" stroke="#444" stroke-width="1.5"/>
+  <text x="610" y="482" font-size="14" text-anchor="middle" fill="#222">on-device model</text>
+  <text x="610" y="501" font-size="12" text-anchor="middle" fill="#666">(sensitive content)</text>
+</svg>

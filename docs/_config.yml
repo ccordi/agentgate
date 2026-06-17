@@ -1,0 +1,9 @@
+theme: jekyll-theme-cayman
+title: agentgate
+description: A transparent reverse-proxy safety gateway for LLM agents.
+
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default

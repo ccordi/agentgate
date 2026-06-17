@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Env / secrets — never commit
+.env
+*.env
+openclaw.json
+!deploy/openclaw.json.example
+
+# Local data
+*.db
+*.sqlite
+*.sqlite3
+data/
+proxy-captures/
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Red-team eval: per-run outputs + judge cache (regenerated, not source)
+eval/redteam/runs/
+# FP-capture raw captures — local-only (arbitrary live web text); only curated items
+# get promoted into the committed corpus. See plan / brainstorm "raw content local-only".
+eval/redteam/corpus/fp_capture.jsonl
+# Regenerable gold-set sampling template (the filled-in gold_set.jsonl IS committed)
+eval/redteam/corpus/gold_set_unlabeled.jsonl
+# Benchmark run artifacts (k6 summaries); bench DB is under data/ (already ignored)
+bench/runs/
+
+# other
+notes/
+# anchored + no trailing slash: ignores both the real models/ dir AND the
+# `models` symlink that spinoff worktrees create (a `models/` rule misses symlinks)
+/models
+tmp/
+
+# Spinoff worktrees (convention: git worktree add .worktrees/<name>) — never committed
+.worktrees/
+# Local-only Claude permission overrides
+.claude/settings.local.json

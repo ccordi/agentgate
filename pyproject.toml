@@ -1,0 +1,87 @@
+[project]
+name = "agentgate"
+version = "0.0.1"
+description = "Transparent reverse-proxy safety gateway for LLM agents (OpenAI- and Anthropic-compatible)"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "httpx>=0.28",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite>=0.20",
+    "redis>=5.2",
+    "pyyaml>=6.0",
+    "cryptography>=43",
+    # observability
+    "prometheus-client>=0.21",
+    "opentelemetry-api>=1.29",
+    "opentelemetry-sdk>=1.29",
+    "opentelemetry-instrumentation-fastapi>=0.50b0",
+]
+
+[project.optional-dependencies]
+# Manual gold-set labeling UI (heavy dep; kept out of the core install).
+label = [
+    "streamlit>=1.40",
+]
+# Model-backed injection guard (ONNX runtime — no torch). Optional; the heuristic
+# scanner is the always-available baseline.
+guard = [
+    "onnxruntime>=1.20",
+    "tokenizers>=0.21",
+    "numpy>=2.0",
+]
+# Tier-3 egress PEP — stdio MCP server wrapping `pep.safe_http_request`.
+# The harness launches this as the only network-capable tool; every
+# call consults the PDP before any egress. FastMCP only; the PEP core has no new deps.
+egress-mcp = [
+    "mcp>=1.2",
+]
+
+[project.scripts]
+agentgate = "agentgate.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentgate"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Injection / secret-pattern signal tables: regexes are most legible on one line each.
+"src/agentgate/security/injection.py" = ["E501"]
+"src/agentgate/security/classifier.py" = ["E501"]
+"src/agentgate/security/redaction.py" = ["E501"]
+"src/agentgate/security/skill_inspector.py" = ["E501"]
+# Tests carry inline SSE/JSON fixtures that don't wrap cleanly.
+"tests/*" = ["E501"]
+# Bench scripts: phase dicts + report f-strings read better unwrapped.
+"bench/*" = ["E501"]
+"eval/redteam/*" = ["E501"]
+# Audit CLI: argparse help strings + SQL read better unwrapped.
+"scripts/audit.py" = ["E501"]
+
+
+# Dev tooling. uv installs the `dev` group by default (PEP 735), so `uv run pytest`
+# and `uv sync` pick it up with no extra flags. Single source of truth for dev deps.
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "ruff>=0.9",
+]
