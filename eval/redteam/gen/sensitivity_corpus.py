@@ -8,20 +8,43 @@ Generates a labeled, clearly-synthetic corpus of exactly 150 items:
     expected route: cloud with redaction)
 
 This generator is fully deterministic and self-validating.
+
+The self-validation is **circular**: every item is asserted against the same
+`classify()`/`detect()` functions the corpus exercises, so agreement is true by
+construction and is not independent evidence. Use the corpus as a routing fixture,
+not as a detection benchmark.
+
+Output is byte-stable: regenerating over the committed
+`corpus/sensitivity_corpus.jsonl` must produce no diff.
+
+    uv run python -m eval.redteam gen sensitivity [--out PATH]
 """
 
 from __future__ import annotations
 
+import argparse
 import random
+from pathlib import Path
 
-from agentgate.security.classifier import Sensitivity, classify
-from agentgate.security.redaction import detect
+from agentgate.redaction import detect
+from agentgate.sensitivity import Sensitivity, classify
 
 from ..loader import SENSITIVITY_CORPUS, write_jsonl
 from ..schema import CorpusItem, LabelOrigin
 
+TIER_SIZE = 50
+TIERS = ("public", "sensitive_doc", "secret_bearing")
 
-def generate_public_items(r: random.Random) -> list[CorpusItem]:
+# The secret detector names an item in the `secret_bearing` tier is allowed to trip, and
+# that a `sensitive_doc` item must not trip. Mirrors redaction.SECRET_PATTERNS' names plus
+# the entropy detector's synthetic name.
+SECRET_TYPE_NAMES = {
+    "private_key", "aws_access_key", "openai_key", "github_token",
+    "slack_token", "google_api_key", "assignment", "high_entropy_token",
+}
+
+
+def generate_public_items() -> list[CorpusItem]:
     projects = [
         "skyline-router", "flexi-grid", "json-flow", "db-sync", "chart-kit",
         "task-runner", "auth-check", "cache-store", "log-fmt", "doc-gen"
@@ -229,6 +252,46 @@ For full list of changes, see the CHANGELOG.md file.
     return items
 
 
+SECRET_LINE_FORMATS = (
+    "ENV SECRET_VALUE={secret}",     # Dockerfile
+    "API_CREDENTIAL={secret}",       # .env
+    "DEPLOY_KEY: {secret}",          # GitHub Actions YAML
+    "api_token: {secret}",           # Kubernetes YAML
+    "DEPLOY_TOKEN = '{secret}'",     # Python config
+    "const token = '{secret}';",     # Node.js server
+    "FOUND: {secret}",               # Bash log
+)
+
+
+def format_secret_line(tmpl_idx: int, secret: str) -> str:
+    """Wrap `secret` in the credential-assignment syntax the host template expects."""
+    return SECRET_LINE_FORMATS[tmpl_idx].format(secret=secret)
+
+
+def make_secret(tmpl_idx: int, idx: int) -> str:
+    """The planted fake secret for item `idx` — one shape per template slot.
+
+    Every value is obviously synthetic (`DUMMY`, `Example`, `dummy_secret_for_test`) while
+    still matching the real detector pattern it is meant to trip.
+    """
+    if tmpl_idx == 0:
+        return f"AKIADUMMYKEY{idx:08d}"
+    if tmpl_idx == 1:
+        return f"sk-ProjExampleKeyForTestOnly{idx:03d}XXXXXXXXXXXXXXXXX"
+    if tmpl_idx == 2:
+        return f"ghp_ExampleGitHubTokenForTesting{idx:03d}XXXXXX"
+    if tmpl_idx == 3:
+        return f"xoxb-ExampleSlackTokenForTesting{idx:03d}XXXXXX"
+    if tmpl_idx == 4:
+        return f"AIzaSyExampleGoogleAPIKeyForTest{idx:03d}XXXX"
+    if tmpl_idx == 5:
+        kw = ["password", "api_key", "secret", "token"][idx % 4]
+        return f'{kw} = "dummy_secret_for_test_{idx:03d}"'
+    return f"""-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQD{idx:03d}examplekey
+-----END PRIVATE KEY-----"""
+
+
 def generate_sensitive_doc_items(r: random.Random) -> list[CorpusItem]:
     first_names = [
         "Alice", "Bob", "Charlie", "Diana", "Ethan", "Fiona", "George",
@@ -423,7 +486,7 @@ This document is strictly confidential and not for public disclosure.
     return items
 
 
-def generate_secret_bearing_items(r: random.Random) -> list[CorpusItem]:
+def generate_secret_bearing_items() -> list[CorpusItem]:
     templates = [
         # Dockerfile
         """FROM node:18-alpine
@@ -508,105 +571,17 @@ app.listen(3000, () => console.log('Server running'));""",
     ]
 
     items = []
-    for idx in range(50):
+    for idx in range(TIER_SIZE):
+        # One index drives both choices: item `idx` plants secret shape `idx % 7` into
+        # host template `idx % 7`, so every (shape, host) pair on the diagonal is covered.
         tmpl_idx = idx % 7
-        secret_type = idx % 7
-        template = templates[tmpl_idx]
-        
-        if secret_type == 0:
-            secret = f"AKIADUMMYKEY{idx:08d}"
-            if tmpl_idx == 0:
-                line = f"ENV SECRET_VALUE={secret}"
-            elif tmpl_idx == 1:
-                line = f"API_CREDENTIAL={secret}"
-            elif tmpl_idx == 2:
-                line = f"DEPLOY_KEY: {secret}"
-            elif tmpl_idx == 3:
-                line = f"api_token: {secret}"
-            elif tmpl_idx == 4:
-                line = f"DEPLOY_TOKEN = '{secret}'"
-            elif tmpl_idx == 5:
-                line = f"const token = '{secret}';"
-            else:
-                line = f"FOUND: {secret}"
-        elif secret_type == 1:
-            secret = f"sk-ProjExampleKeyForTestOnly{idx:03d}XXXXXXXXXXXXXXXXX"
-            if tmpl_idx == 0:
-                line = f"ENV SECRET_VALUE={secret}"
-            elif tmpl_idx == 1:
-                line = f"API_CREDENTIAL={secret}"
-            elif tmpl_idx == 2:
-                line = f"DEPLOY_KEY: {secret}"
-            elif tmpl_idx == 3:
-                line = f"api_token: {secret}"
-            elif tmpl_idx == 4:
-                line = f"DEPLOY_TOKEN = '{secret}'"
-            elif tmpl_idx == 5:
-                line = f"const token = '{secret}';"
-            else:
-                line = f"FOUND: {secret}"
-        elif secret_type == 2:
-            secret = f"ghp_ExampleGitHubTokenForTesting{idx:03d}XXXXXX"
-            if tmpl_idx == 0:
-                line = f"ENV SECRET_VALUE={secret}"
-            elif tmpl_idx == 1:
-                line = f"API_CREDENTIAL={secret}"
-            elif tmpl_idx == 2:
-                line = f"DEPLOY_KEY: {secret}"
-            elif tmpl_idx == 3:
-                line = f"api_token: {secret}"
-            elif tmpl_idx == 4:
-                line = f"DEPLOY_TOKEN = '{secret}'"
-            elif tmpl_idx == 5:
-                line = f"const token = '{secret}';"
-            else:
-                line = f"FOUND: {secret}"
-        elif secret_type == 3:
-            secret = f"xoxb-ExampleSlackTokenForTesting{idx:03d}XXXXXX"
-            if tmpl_idx == 0:
-                line = f"ENV SECRET_VALUE={secret}"
-            elif tmpl_idx == 1:
-                line = f"API_CREDENTIAL={secret}"
-            elif tmpl_idx == 2:
-                line = f"DEPLOY_KEY: {secret}"
-            elif tmpl_idx == 3:
-                line = f"api_token: {secret}"
-            elif tmpl_idx == 4:
-                line = f"DEPLOY_TOKEN = '{secret}'"
-            elif tmpl_idx == 5:
-                line = f"const token = '{secret}';"
-            else:
-                line = f"FOUND: {secret}"
-        elif secret_type == 4:
-            secret = f"AIzaSyExampleGoogleAPIKeyForTest{idx:03d}XXXX"
-            if tmpl_idx == 0:
-                line = f"ENV SECRET_VALUE={secret}"
-            elif tmpl_idx == 1:
-                line = f"API_CREDENTIAL={secret}"
-            elif tmpl_idx == 2:
-                line = f"DEPLOY_KEY: {secret}"
-            elif tmpl_idx == 3:
-                line = f"api_token: {secret}"
-            elif tmpl_idx == 4:
-                line = f"DEPLOY_TOKEN = '{secret}'"
-            elif tmpl_idx == 5:
-                line = f"const token = '{secret}';"
-            else:
-                line = f"FOUND: {secret}"
-        elif secret_type == 5:
-            kw = ["password", "api_key", "secret", "token"][idx % 4]
-            secret = f'{kw} = "dummy_secret_for_test_{idx:03d}"'
-            line = secret
-        elif secret_type == 6:
-            secret = f"""-----BEGIN PRIVATE KEY-----
-MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQD{idx:03d}examplekey
------END PRIVATE KEY-----"""
-            line = secret
-        else:
-            raise ValueError()
+        secret = make_secret(tmpl_idx, idx)
+        # Shapes 5 and 6 already read as a credential in situ (a `kw = "…"` assignment, a
+        # PEM block), so they are planted verbatim; the rest need the host's syntax.
+        line = secret if tmpl_idx in (5, 6) else format_secret_line(tmpl_idx, secret)
 
-        text = template.replace("{SECRET_LINE}", line)
-        
+        text = templates[tmpl_idx].replace("{SECRET_LINE}", line)
+
         if secret not in text:
             raise ValueError(f"Secret not found in text: {secret}")
         if text.count(secret) != 1:
@@ -630,16 +605,14 @@ MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQD{idx:03d}examplekey
 
 
 def validate_items(items: list[CorpusItem]):
-    public_count = 0
-    sensitive_doc_count = 0
-    secret_bearing_count = 0
-    
+    counts = dict.fromkeys(TIERS, 0)
+
     for item in items:
         det = detect(item.text)
         cls_res = classify(item.text)
         
         if item.sensitivity == "public":
-            public_count += 1
+            counts["public"] += 1
             if len(det) > 0:
                 raise ValueError(
                     f"Public item {item.id} triggered detectors: {det}"
@@ -651,19 +624,14 @@ def validate_items(items: list[CorpusItem]):
                 )
         
         elif item.sensitivity == "sensitive_doc":
-            sensitive_doc_count += 1
+            counts["sensitive_doc"] += 1
             if len(det) == 0:
                 raise ValueError(
                     f"Sensitive doc item {item.id} triggered no detectors"
                 )
             
             # Should not trigger secret detectors
-            detected_types = {d[0] for d in det}
-            secret_types = {
-                "private_key", "aws_access_key", "openai_key", "github_token",
-                "slack_token", "google_api_key", "assignment", "high_entropy_token"
-            }
-            triggered_secrets = detected_types.intersection(secret_types)
+            triggered_secrets = {d[0] for d in det} & SECRET_TYPE_NAMES
             if triggered_secrets:
                 raise ValueError(
                     f"Sensitive doc item {item.id} triggered secret detectors: "
@@ -676,7 +644,7 @@ def validate_items(items: list[CorpusItem]):
                 )
                 
         elif item.sensitivity == "secret_bearing":
-            secret_bearing_count += 1
+            counts["secret_bearing"] += 1
             if not item.planted_secret:
                 raise ValueError(
                     f"Secret bearing item {item.id} is missing planted_secret field"
@@ -697,12 +665,7 @@ def validate_items(items: list[CorpusItem]):
                 )
                 
             # Verify detect finds it
-            detected_types = [t for t, _ in det]
-            secret_types = {
-                "private_key", "aws_access_key", "openai_key", "github_token",
-                "slack_token", "google_api_key", "assignment", "high_entropy_token"
-            }
-            has_secret = any(t in secret_types for t in detected_types)
+            has_secret = any(t in SECRET_TYPE_NAMES for t, _ in det)
             if not has_secret:
                 raise ValueError(
                     f"Secret bearing item {item.id} triggered no secret detectors: {det}"
@@ -713,38 +676,59 @@ def validate_items(items: list[CorpusItem]):
                     f"{cls_res.sensitivity} instead of SECRET"
                 )
                 
+    for tier, n in counts.items():
+        if n != TIER_SIZE:
+            raise ValueError(f"tier {tier!r} has {n} items, expected {TIER_SIZE}")
+
     print(
-        f"Self-check passed: public={public_count}, "
-        f"sensitive_doc={sensitive_doc_count}, "
-        f"secret_bearing={secret_bearing_count}"
+        f"Self-check passed: public={counts['public']}, "
+        f"sensitive_doc={counts['sensitive_doc']}, "
+        f"secret_bearing={counts['secret_bearing']}"
     )
 
 
-def main():
-    # Deterministic generation using seeded randomizers
-    r_public = random.Random(42)
-    r_sensitive = random.Random(2026)
-    r_secret = random.Random(10101)
-
+def build_corpus() -> list[CorpusItem]:
+    """The 150 items, in committed order. Only the PII tier draws from an RNG."""
     print("Generating public items...")
-    public_items = generate_public_items(r_public)
-    
-    print("Generating sensitive_doc items...")
-    sensitive_items = generate_sensitive_doc_items(r_sensitive)
-    
-    print("Generating secret_bearing items...")
-    secret_items = generate_secret_bearing_items(r_secret)
+    public_items = generate_public_items()
 
-    all_items = public_items + sensitive_items + secret_items
-    
+    print("Generating sensitive_doc items...")
+    # Seeded so the synthetic names/SSNs/phone numbers are stable across regenerations.
+    sensitive_items = generate_sensitive_doc_items(random.Random(2026))
+
+    print("Generating secret_bearing items...")
+    secret_items = generate_secret_bearing_items()
+
+    return public_items + sensitive_items + secret_items
+
+
+def _add_args(p) -> None:
+    p.add_argument("--out", default=None, type=Path,
+                   help=f"write to PATH instead of {SENSITIVITY_CORPUS.name} "
+                        "(use a temp path to diff before overwriting the committed corpus)")
+
+
+def register(sub) -> None:
+    """Register the `gen sensitivity` subcommand on `python -m eval.redteam`."""
+    p = sub.add_parser("sensitivity", help="regenerate the synthetic sensitivity corpus")
+    _add_args(p)
+    p.set_defaults(fn=main)
+
+
+def main(args=None) -> None:
+    out = getattr(args, "out", None) or SENSITIVITY_CORPUS
+    all_items = build_corpus()
+
     print(f"Total items generated: {len(all_items)}")
     print("Validating items...")
     validate_items(all_items)
 
-    print(f"Writing corpus to {SENSITIVITY_CORPUS}...")
-    n = write_jsonl(SENSITIVITY_CORPUS, all_items)
-    print(f"Successfully wrote {n} items to {SENSITIVITY_CORPUS}")
+    print(f"Writing corpus to {out}...")
+    n = write_jsonl(out, all_items)
+    print(f"Successfully wrote {n} items to {out}")
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__":  # direct invocation delegates to the same main()
+    _ap = argparse.ArgumentParser(description=__doc__)
+    _add_args(_ap)
+    main(_ap.parse_args())

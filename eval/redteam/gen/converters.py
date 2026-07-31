@@ -1,7 +1,7 @@
 """In-house obfuscation converters — the seed-and-mutate **control** axis.
 
 The garak evaluation found that DeBERTa *mostly caught* character-level obfuscation
-(garak ``encoding.*`` recall 33-83%) — so encoding is the control, not the headline. We keep
+(garak ``encoding.*`` recall 33-83%) — so encoding is the control, not the primary set. We keep
 a small in-house converter set rather than pulling PyRIT: PyRIT's value is its multi-turn
 orchestrator, and for single-turn string mutation a few pure-stdlib functions are leaner and
 add **zero** dependencies.

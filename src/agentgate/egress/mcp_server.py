@@ -1,6 +1,6 @@
 """Tier-3 egress PEP — stdio MCP server.
 
-The live wiring for the `safe_http_request` PEP core (`pep/safe_http_request.py`).
+The live wiring for the `safe_http_request` PEP core (`egress/pep.py`).
 This exposes a single MCP tool over stdio that the harness registers as the *only*
 network-capable tool: with `Bash(curl*|wget*|fetch*)` and any built-in fetch tool
 excluded in the harness permissions config, every outbound HTTP request the agent
@@ -9,7 +9,7 @@ first.
 
 This server adds **no policy** — it is the PEP's transport shell. All adjudication
 lives in the PDP; all consult-then-perform-or-refuse logic lives in
-`pep/safe_http_request.py`. This module only: (1) marshals MCP tool arguments into a
+`egress/pep.py`. This module only: (1) marshals MCP tool arguments into a
 `safe_http_request` call, (2) supplies the PDP bearer from the environment, and
 (3) handles the carry-note — an outbound request can throw *after* the PDP allows it
 (DNS failure, connection refused, read timeout against the real destination), and
@@ -17,13 +17,17 @@ lives in the PDP; all consult-then-perform-or-refuse logic lives in
 result instead of crashing the MCP server / surfacing an opaque stack trace to the
 model.
 
-Auth: the PEP reads `AGENTGATE_LOCAL_API_KEY` from the environment and presents it as
-the PDP bearer. If the key is unset, the PDP's auth is a no-op (loopback posture) and
-we send no bearer — matching the gateway's own conditional-auth stance.
+Auth: the PEP is a concrete token-holding caller. It reads `AGENTGATE_PDP_TOKEN`
+from the environment and presents it as the PDP bearer. The PDP's auth is
+mandatory — the gateway refuses to start without the token — so an unset value
+here fails closed: the PDP 401s, `safe_http_request` reports it, nothing
+egresses. It deliberately does not read `AGENTGATE_LOCAL_API_KEY`; that is the
+local *upstream's* credential, and reusing it would span two trust boundaries
+with one value.
 
 Run with the extra installed:
 
-    uv run --extra egress-mcp python -m agentgate.pep.mcp_server
+    uv run --extra egress-mcp python -m agentgate.egress.mcp_server
 """
 
 from __future__ import annotations
@@ -33,14 +37,14 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from .safe_http_request import DEFAULT_PDP_URL, safe_http_request
+from agentgate.egress.pep import DEFAULT_PDP_URL, safe_http_request
 
 mcp = FastMCP("agentgate-egress")
 
 
 def _bearer() -> str | None:
-    """PDP bearer from the environment, or None (loopback no-auth posture)."""
-    return os.environ.get("AGENTGATE_LOCAL_API_KEY") or None
+    """PDP bearer from the environment. None fails closed at the PDP (401), not open."""
+    return os.environ.get("AGENTGATE_PDP_TOKEN") or None
 
 
 def _pdp_url() -> str:
@@ -98,6 +102,11 @@ def safe_http_request_tool(
         # httpx can raise non-HTTPError types for malformed agent input — e.g.
         # httpx.InvalidURL, which is NOT an HTTPError subclass — and a single uncaught
         # exception kills the only sanctioned network path.
+        #
+        # `safe_http_request` converts every pre-verdict failure into an explicit
+        # `fail-closed:pep-error` deny before it can raise, so anything reaching here is
+        # genuinely post-verdict — "egress permitted by policy, but the outbound request
+        # failed" is then true, never a claim about a request the policy never saw.
         return {
             "executed": False,
             "decision": "allow",

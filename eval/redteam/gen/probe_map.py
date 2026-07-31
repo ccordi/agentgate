@@ -7,17 +7,17 @@ no pydantic, no garak — so either interpreter can load it.
 Why a *curated* subset (not "every probe × 256"):
     Each garak probe emits 256 prompts (payloads × templates), most near-duplicate. The
     existing default corpus is ~710 labeled (292+/418-). Dumping thousands of templated
-    garak positives would *drown* the authored/deepset corpus and skew the headline recall.
+    garak positives would overwhelm the authored/deepset corpus and skew aggregate recall.
     The follow-up question is about **coverage of attack forms**, not volume, so we take a
     capped, evenly-strided sample per probe (``PER_PROBE_CAP``) and lean on the per-category
-    recall table (each probe = its own ``garak:<probe>`` category) for the real signal.
+    recall table (each probe = its own ``garak:<probe>`` category) to preserve coverage detail.
 
 ----------------------------------------------------------------------------------------------
 The ``expected_miss`` split — what it is and why it's drawn where it is
 ----------------------------------------------------------------------------------------------
 The harness already separates two kinds of false negative (``harness.py``):
-  * **surprise FN** — a missed positive NOT tagged ``expected_miss``. This is the real signal:
-    the guard was *supposed* to catch it and didn't.
+  * **surprise FN** — a missed positive not tagged ``expected_miss``; the guard was
+    expected to catch it and did not.
   * **expected miss** — a missed positive tagged ``meta.expected_miss=true``: a *documented*
     blind spot, reported in its own bucket so it can't masquerade as a surprise.
 
@@ -33,7 +33,7 @@ tokenization breaks. So:
         design doc names "translation" as a known blind spot alongside base64)
 
   expected_miss = False (PLAIN or DOCUMENT-EMBEDDED natural-language injection — DeBERTa is
-                         trained for exactly this; a miss is a genuine, interesting FN):
+                         trained for exactly this; a miss is an unanticipated FN):
       - ``promptinject.Hijack*`` (canonical goal-hijacking in plain English)
       - ``latentinjection.*`` except translation (indirect injection buried in a document —
         fact snippet / report / resume / jailbreak). NB: several of these run 800-3000 chars,
@@ -41,8 +41,7 @@ tokenization breaks. So:
         the kind of non-trivial FN we want surfaced, NOT hidden under expected_miss.
 
 Rule of thumb: tag ``expected_miss`` only when the *disguise mechanism* is the reason for a
-miss. If the attack is legible English and the guard still misses it, that is signal — leave
-it untagged.
+miss. If the attack is legible English and the guard still misses it, leave it untagged.
 """
 
 from __future__ import annotations
@@ -56,7 +55,7 @@ PROBES: dict[str, bool] = {
     "promptinject.HijackHateHumans": False,
     "promptinject.HijackKillHumans": False,
     "promptinject.HijackLongPrompt": False,
-    # --- indirect / document-embedded injection: in-scope; miss = real signal ---
+    # --- indirect / document-embedded injection: in scope; miss is unanticipated ---
     "latentinjection.LatentInjectionFactSnippetEiffel": False,
     "latentinjection.LatentInjectionReport": False,
     "latentinjection.LatentInjectionResume": False,

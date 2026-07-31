@@ -7,10 +7,10 @@ the unchanged ``score``/``report`` chain.
 Two product lines, mirroring the garak ``expected_miss`` split so the report reads
 consistently:
 
-  * **Headline — indirect / long-context (``expected_miss=False``).** The attacker model
+  * **Primary set — indirect / long-context (``expected_miss=False``).** The attacker model
     (``attacker.py``) expands agent-specific seeds (``seeds.py``) into document-embedded and
     tool-result attacks. This is the axis the garak evaluation found the guard *misses* — a
-    miss here is real signal, so it is left untagged.
+    miss here is unanticipated, so it is left untagged.
   * **Control — obfuscation (``expected_miss=True``).** Canonical instructions run through the
     in-house converters (``converters.py``). The garak evaluation showed DeBERTa mostly catches
     these; tagged as a documented tokenization blind spot, like garak's ``encoding.*``.
@@ -46,7 +46,7 @@ def _is_control(item: CorpusItem) -> bool:
 
 
 def build_attacker_items(pairs: list[tuple[Seed, str]]) -> list[CorpusItem]:
-    """(seed, attack-text) → headline CorpusItems (indirect/long-context; expected_miss=False)."""
+    """Build primary indirect/long-context items with ``expected_miss=False``."""
     items: list[CorpusItem] = []
     for seed, text in pairs:
         items.append(CorpusItem(
@@ -140,20 +140,30 @@ async def revalidate_corpus() -> list[CorpusItem]:
     return kept + control
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(prog="python -m eval.redteam.gen.seed_mutate")
-    ap.add_argument("-n", "--variants", type=int, default=VARIANTS_PER_SEED,
-                    help=f"attacker variants per seed (default {VARIANTS_PER_SEED})")
-    ap.add_argument("--revalidate", action="store_true",
-                    help="re-judge the existing committed attacks with the current "
-                         "AGENTGATE_JUDGE_* model (no regeneration); for swapping judge family")
-    args = ap.parse_args()
+def _add_args(p) -> None:
+    p.add_argument("-n", "--variants", type=int, default=VARIANTS_PER_SEED,
+                   help=f"attacker variants per seed (default {VARIANTS_PER_SEED})")
+    p.add_argument("--revalidate", action="store_true",
+                   help="re-judge the existing committed attacks with the current "
+                        "AGENTGATE_JUDGE_* model (no regeneration); for swapping judge family")
+
+
+def register(sub) -> None:
+    """Register the `gen seed-mutate` subcommand on `python -m eval.redteam`."""
+    p = sub.add_parser("seed-mutate", help="regenerate the seed-and-mutate attack corpus")
+    _add_args(p)
+    p.set_defaults(fn=main)
+
+
+def main(args) -> None:
     items = asyncio.run(revalidate_corpus() if args.revalidate
                         else generate_corpus(args.variants))
     n = write_jsonl(OUT, items)
     em = sum(1 for i in items if i.meta.get("expected_miss"))
-    print(f"wrote {n} items → {OUT}  ({em} control/expected_miss / {n - em} headline)")
+    print(f"wrote {n} items → {OUT}  ({em} control/expected_miss / {n - em} primary)")
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__":  # direct invocation delegates to the same main()
+    _ap = argparse.ArgumentParser(prog="python -m eval.redteam.gen.seed_mutate")
+    _add_args(_ap)
+    main(_ap.parse_args())

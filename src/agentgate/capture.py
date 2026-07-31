@@ -15,7 +15,14 @@ Scope guardrails:
     write the corpus JSONL shape directly (kept in sync with eval/redteam/schema.py).
   * Captured items are **unlabeled** (``label_origin: ""``); the judge labels them later.
     The scanner's own verdict is recorded only as telemetry, never as a label (avoids the
-    circularity the red-team methodology is built to prevent).
+    circularity the red-team methodology is built to prevent). That telemetry scanner is
+    fixed to the heuristic by design (it is the one backend with no optional deps and no
+    eval-package coupling), so ``scanner_score`` is not the deployed backend's score.
+
+Where the file goes: ``AGENTGATE_CAPTURE_PATH``, default ``data/fp_capture.jsonl``. To run
+the FP-capture workflow, point it at the eval tree — or capture here and copy the result
+in; the measured corpus is frozen as
+``eval/redteam/corpus/fp_capture.frozen.jsonl`` and must not be appended to in place.
 """
 
 from __future__ import annotations
@@ -27,7 +34,8 @@ import logging
 import time
 from pathlib import Path
 
-from . import injection
+from agentgate import content
+from agentgate.guards import heuristic
 
 log = logging.getLogger("agentgate.capture")
 
@@ -52,10 +60,10 @@ async def capture(path: str, agent_id: str, messages: list[dict]) -> None:
     """
     try:
         lines: list[str] = []
-        for vector, text in injection.extract_untrusted(messages):
+        for vector, text in content.extract_untrusted(messages):
             if not text:
                 continue
-            v = injection.scan_text(text)
+            v = heuristic.scan_text(text)
             rec = {
                 "id": _stable_id(text),
                 "source": "capture",

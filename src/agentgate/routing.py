@@ -1,15 +1,16 @@
 """Rules-table router — evaluates the declarative routing config.
 
-Pure decision logic: given the sensitivity class, agent id, and failure flags, return which
-logical target (local vs cloud) to use and which rule fired. Provider resolution lives in
-``providers.py``; this module has no I/O.
+Pure decision logic: given the sensitivity class, agent id, and failure flags, return
+which logical target (local vs cloud) to use and which rule fired. Provider resolution
+is the one impure lookup and is kept at the bottom, so the decision half stays testable
+without touching config.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from agentgate.config import RoutingConfig, RoutingRule
+from agentgate.config import Provider, RoutingConfig, RoutingRule, Settings
 
 
 @dataclass
@@ -56,3 +57,14 @@ def decide(ctx: RouteContext, cfg: RoutingConfig) -> RouteDecision:
             return RouteDecision(cfg.default_cloud, False, rule.name, rule.action)
     # No rule matched (shouldn't happen — the default rule is unconditional) → safe default.
     return RouteDecision(cfg.default_cloud, False, "implicit-default", "prefer_cloud")
+
+
+# --- provider resolution (the one impure lookup) ------------------------------------
+
+def resolve(settings: Settings, decision: RouteDecision) -> Provider:
+    """Map a RouteDecision's provider name to the registered Provider.
+
+    Thin layer over the provider registry in ``config.Settings``, kept here so the
+    local↔cloud indirection lives in one place.
+    """
+    return settings.provider(decision.provider)

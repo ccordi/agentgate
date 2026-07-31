@@ -1,4 +1,4 @@
-// k6 load script for the agentgate benchmark (ARTIFACT 3).
+// k6 load script for the agentgate benchmarks.
 //
 // Drives a streaming OpenAI chat-completion against either the gateway or the mock upstream
 // directly (baseline), parameterized entirely by env so bench/run.py can reuse one script:
@@ -45,7 +45,7 @@ export const options = {
           },
         },
   thresholds: { http_req_failed: ['rate<0.01'] },
-  // Ensure p99 (and the rest) are present in the handleSummary export.
+  // Include every percentile used by the report.
   summaryTrendStats: ['avg', 'min', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
 };
 

@@ -1,9 +1,14 @@
 """Model-backed injection guard — ONNX DeBERTa classifier behind the `scan_text` interface.
 
-An interchangeable alternative to the heuristic `injection.scan_text`: same signature, same
-`Verdict` return type, so the red-team harness and (eventually) the gateway hot path can
-swap detectors with no other changes. Runs **in-process** on onnxruntime (no torch, no model
-server, no network) — a guard must not egress content.
+Same call shape as `guards.heuristic.scan_text` and the same `Verdict` return type, so
+the red-team harness and the gateway hot path can swap detectors with no other changes.
+The backends are not interchangeable in behavior, though: they differ in scan surface
+(the LLM guard sees tool output only), in coverage bound (this one scores at most
+`_MAX_WINDOWS` windows — roughly 25.8 KB — of a single item, silently), and in verdict
+shape (the LLM guard is binary). Selecting a backend selects all three.
+
+Runs **in-process** on onnxruntime (no torch, no model server, no network) — a guard
+must not egress content.
 
 Default model: `protectai/deberta-v3-base-prompt-injection-v2` (ONNX export), a ~184M
 sequence classifier with labels {0: SAFE, 1: INJECTION}. The injection probability becomes
@@ -20,7 +25,7 @@ import os
 from functools import lru_cache
 from pathlib import Path
 
-from .injection import FLAG_THRESHOLD, HARD_THRESHOLD, Verdict, extract_untrusted
+from agentgate.guards import FLAG_THRESHOLD, HARD_THRESHOLD, Verdict
 
 _DEFAULT_DIR = "models/protectai-deberta-v3-base-prompt-injection-v2/onnx"
 _MAX_TOKENS = 512
@@ -36,7 +41,8 @@ class DebertaGuard:
         from tokenizers import Tokenizer
 
         self._np = np
-        d = Path(model_dir or os.getenv("AGENTGATE_GUARD_MODEL_DIR", _DEFAULT_DIR))
+        env_dir = os.getenv("AGENTGATE_GUARD_MODEL_DIR", _DEFAULT_DIR)
+        d = Path(model_dir or env_dir)
         if not (d / "model.onnx").exists():
             raise FileNotFoundError(
                 f"guard model not found at {d}/model.onnx — set AGENTGATE_GUARD_MODEL_DIR "
@@ -86,15 +92,5 @@ def warmup() -> None:
 
 
 def scan_text(text: str) -> Verdict:
-    """Drop-in replacement for ``injection.scan_text`` backed by the DeBERTa classifier."""
+    """Score one piece of untrusted text with the DeBERTa classifier."""
     return _guard().scan_text(text)
-
-
-def scan_request(messages: list[dict]) -> Verdict:
-    """Mirror ``injection.scan_request``: strongest verdict over the untrusted content."""
-    worst = Verdict.clean()
-    for source, text in extract_untrusted(messages):
-        v = scan_text(text)
-        if v.score > worst.score:
-            worst = Verdict(v.flagged, v.score, [f"{source}:{r}" for r in v.reasons], v.hard)
-    return worst

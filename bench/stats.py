@@ -1,6 +1,6 @@
 """Pure latency-stats helpers for the benchmark (no numpy).
 
-Used to turn the per-request latency columns the gateway already records in the audit DB
+Turns the per-request latency columns recorded in the audit DB
 (`latency_total_ms`, `latency_upstream_ms`, `latency_inject_ms`) into the p50/p90/p95/p99
 decomposition the benchmark report renders. Kept dependency-free and unit-tested in isolation.
 """

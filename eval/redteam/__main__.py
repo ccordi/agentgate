@@ -1,9 +1,30 @@
-"""CLI: ``python -m eval.redteam {score|judge|sample|report}``.
+"""The one entry point for the red-team eval suite.
 
-  score   offline metrics over the labeled corpus (no API key needed)
-  judge   run the independent LLM judge to label items (needs AGENTGATE_JUDGE_API_KEY)
-  sample  emit a stratified gold-set template for a human to label
-  report  generate docs/redteam-results.md from scores + judge cache + gold set
+Offline — runs from a fresh clone with no keys and no model downloads:
+
+  score            offline metrics over the labeled corpus
+  report           generate docs/redteam-results.md from scores + judge cache + gold set
+  sample           emit a stratified gold-set template for a human to label
+  classifier-eval  sensitivity-classifier over-fire report
+
+Needs a key or a local model server:
+
+  judge            run the independent LLM judge to label items (AGENTGATE_JUDGE_API_KEY)
+  llm-eval         local-LLM guard vs the DeBERTa baseline
+  probes-eval      obfuscation + security-meta probes
+
+Needs a running gateway (drives real traffic through it):
+
+  route-eval       push the sensitivity corpus through, verify routing in the audit DB
+  traffic          push real OSS content through, measure block rate and latency
+
+Corpus generation (writes committed artifacts — read eval/redteam/README.md first):
+
+  gen sensitivity  regenerate the synthetic sensitivity corpus (deterministic)
+  gen seed-mutate  regenerate the seed-and-mutate attacks (NOT deterministic)
+
+Each subcommand's module keeps its own ``main(args)``; direct
+``python -m eval.redteam.<module>`` invocation still works and runs the same function.
 """
 
 from __future__ import annotations
@@ -17,10 +38,10 @@ from . import harness
 from . import judge as judge_mod
 from . import report as report_mod
 from .agreement import cohen_kappa
+from .common import REPO_ROOT
 from .loader import (
     CORPUS_DIR,
     GOLD_SET,
-    PKG_DIR,
     RUNS_DIR,
     load_corpus,
     load_gold_set,
@@ -29,7 +50,6 @@ from .loader import (
 from .sampling import stratified_sample, to_gold_template
 from .schema import LabelOrigin
 
-REPO_ROOT = PKG_DIR.parents[1]
 ARTIFACT = REPO_ROOT / "docs" / "redteam-results.md"
 GOLD_TEMPLATE = CORPUS_DIR / "gold_set_unlabeled.jsonl"
 
@@ -41,15 +61,15 @@ def _timestamp() -> str:
 def _detector(name: str):
     """Map a detector name → (scan_fn, label). Imports the model backend lazily."""
     if name == "deberta":
-        from agentgate.security import model_guard
-        return model_guard.scan_text, "deberta-v3-prompt-injection-v2"
+        from agentgate.guards import deberta
+        return deberta.scan_text, "deberta-v3-prompt-injection-v2"
     elif name == "llm-guard":
-        from .judge import JudgeConfig
-        from .judge import scan_text as llm_scan_text
-        cfg = JudgeConfig()
-        return llm_scan_text, f"llm-guard:{cfg.model}"
-    from agentgate.security import injection
-    return injection.scan_text, "heuristic"
+        from .judge import CACHE_PATH, JudgeConfig, LLMGuard
+        # The harness scores with its own cache file, not the gateway's runtime one.
+        cfg = JudgeConfig(cache_path=str(CACHE_PATH))
+        return LLMGuard(cfg).scan_text, f"llm-guard:{cfg.model}"
+    from agentgate.guards import heuristic
+    return heuristic.scan_text, "heuristic"
 
 
 def cmd_score(args) -> None:
@@ -125,9 +145,9 @@ def cmd_report(_args) -> None:
     comparison = [_comparison_row(heuristic_run)]
     run = heuristic_run
     try:
-        from agentgate.security import model_guard
+        from agentgate.guards import deberta
         deberta_run = harness.run(
-            items, model_guard.scan_text, "deberta-v3-prompt-injection-v2"
+            items, deberta.scan_text, "deberta-v3-prompt-injection-v2"
         ).as_dict()
         comparison.append(_comparison_row(deberta_run))
         run = deberta_run  # detailed body describes the deployed detector
@@ -166,8 +186,13 @@ def cmd_report(_args) -> None:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(prog="python -m eval.redteam")
+    p = argparse.ArgumentParser(
+        prog="python -m eval.redteam",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
+
     sc = sub.add_parser("score", help="offline metrics (no key)")
     sc.add_argument("--detector", default="heuristic", choices=["heuristic", "deberta", "llm-guard"],
                     help="detector to evaluate (deberta needs the `guard` extra + model)")
@@ -183,6 +208,19 @@ def main() -> None:
                     help="write to PATH instead of docs/redteam-results.md (e.g. a temp file "
                          "to diff before overwriting the deliverable)")
     rp.set_defaults(fn=cmd_report)
+
+    # The former standalone scripts. Each module owns its own flags via `register`, so
+    # there is one definition of each command's interface, not two.
+    from . import classifier_eval, extra_probes_eval, llm_eval, oss_traffic_gen, route_eval
+    for mod in (classifier_eval, llm_eval, extra_probes_eval, route_eval, oss_traffic_gen):
+        mod.register(sub)
+
+    gen = sub.add_parser("gen", help="regenerate a committed corpus").add_subparsers(
+        dest="gen_cmd", required=True)
+    from .gen import seed_mutate, sensitivity_corpus
+    sensitivity_corpus.register(gen)
+    seed_mutate.register(gen)
+
     args = p.parse_args()
     args.fn(args)
 

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Manual latency benchmark for the gateway overhead figure used in the write-up.
 #
-# Spins up an ISOLATED bench gateway (:4300, mock provider, throwaway data/bench.db)
+# Starts an isolated benchmark gateway (:4300, mock provider, throwaway data/bench.db)
 # in front of a deterministic mock upstream (:4200), runs k6 load phases, and renders
-# the report. It NEVER touches a running/production gateway instance.
+# the report. It does not use a running gateway instance.
 #
-#   Output artifact : docs/benchmarks.md   (full report — this is what I read)
+#   Full report     : docs/benchmarks.md
 #   Quick summary   : bench/runs/SUMMARY.txt (key overhead lines, easy to paste)
 #
 # Usage:
@@ -20,8 +20,8 @@ if ! command -v k6 >/dev/null 2>&1; then
   exit 1
 fi
 
-# Pin the injection guard to the heuristic (regex) scanner so this measures the
-# gateway's PROXY-FLOOR overhead deterministically — no ML model loaded, regardless
+# Pin the injection guard to the heuristic scanner so this measures the gateway's
+# proxy-floor overhead without loading an ML model, regardless
 # of whether the `guard` extra / DeBERTa ONNX model happen to be present locally.
 # The DeBERTa (~40ms) and local-LLM (~1.4s) guard costs are separate tiers, measured
 # elsewhere; this run is the proxy pass-through figure only.
@@ -42,7 +42,7 @@ mkdir -p bench/runs
   echo "agentgate bench summary"
   echo "======================="
   echo
-  echo "--- Gateway overhead (the headline figure) ---"
+  echo "--- Gateway overhead ---"
   grep -A2 -iE "## Gateway overhead" "$ART" || echo "(overhead section not found in $ART)"
   echo
   echo "--- Streaming overhead ---"
@@ -55,4 +55,3 @@ echo
 echo "==> Done."
 echo "    Full report : $ART"
 echo "    Quick paste : $OUT"
-echo "    Tell me when this is finished and I'll read $ART and wire the verified number into the post."

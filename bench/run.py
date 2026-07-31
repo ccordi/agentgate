@@ -3,7 +3,7 @@
 Spins up an **isolated** bench gateway (separate port/DB/provider) in front of the
 deterministic mock upstream, runs k6 load phases against both the gateway and the mock
 directly (baseline), reads the gateway's own per-stage latency from its audit DB, and
-renders the report. **Never touches a running gateway instance.**
+renders the report. It does not use a running gateway instance.
 
     uv run python -m bench.run            # full run (needs k6: `brew install k6`)
     uv run python -m bench.run --quick    # shorter durations for a smoke run
@@ -67,36 +67,37 @@ def _start_processes() -> list[subprocess.Popen]:
         **os.environ,
         "AGENTGATE_PORT": str(GW_PORT),
         "AGENTGATE_DEFAULT_PROVIDER": "mock",
-        # CRITICAL: disable the rules-table router. It is enabled by default, and when
-        # enabled it — not AGENTGATE_DEFAULT_PROVIDER — chooses the upstream. A benign
-        # bench request falls through to the `default` rule (prefer_cloud → "gemini"), so
-        # the gateway would forward every request to the *real* Google Gemini endpoint,
-        # which 400s on the fake bench token. That silently routed the whole benchmark at
-        # a live cloud API and made every gateway phase show fail% 100%. With routing off,
-        # settings.provider() honors AGENTGATE_DEFAULT_PROVIDER=mock. See _smoke_check().
+        # Disable the rules-table router so AGENTGATE_DEFAULT_PROVIDER selects the mock.
+        # Otherwise the default route selects Gemini and the fake benchmark token fails.
         "AGENTGATE_ROUTING__ENABLED": "false",
         "AGENTGATE_DATABASE_URL": f"sqlite+aiosqlite:///{DB_PATH}",
+        # Required: validate_runtime_settings refuses to start without both. Fixed
+        # throwaway values — this gateway is bench-local on :4300 and is torn down below.
+        "AGENTGATE_ADMIN_TOKEN": "agentgate-bench-admin-token",
+        "AGENTGATE_PDP_TOKEN": "agentgate-bench-pdp-token",
     }
+    # Keep the gateway's stderr: a startup refusal (bad posture, port in use) otherwise
+    # surfaces only as the "did not come up" timeout below, which names the wrong cause.
+    gw_log = DB_PATH.parent / "bench-gateway.log"
     gw = subprocess.Popen(
         ["uv", "run", "agentgate"],
-        cwd=REPO_ROOT, env=gw_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        cwd=REPO_ROOT, env=gw_env, stdout=subprocess.DEVNULL, stderr=gw_log.open("w"),
     )
     if not _wait_http(f"http://127.0.0.1:{MOCK_PORT}/", want_200=False):
         raise RuntimeError("mock upstream did not come up on :4200")
     if not _wait_http(f"http://127.0.0.1:{GW_PORT}/healthz", want_200=True):
-        raise RuntimeError("bench gateway did not come up on :4300")
+        tail = gw_log.read_text().strip().splitlines()[-10:]
+        raise RuntimeError(
+            "bench gateway did not come up on :4300\n" + "\n".join(tail))
     _smoke_check()
     return [gw, mock]
 
 
 def _smoke_check() -> None:
-    """Fail loudly if the gateway isn't actually streaming the mock's SSE back.
+    """Check that the gateway streams the mock's SSE response.
 
-    /healthz only proves the process is up — it does NOT exercise the forward path, so a
-    mis-routed gateway (e.g. forwarding to a real cloud upstream that rejects the bench
-    token) sails past it and silently poisons every number in the report. One real
-    streaming request closes that gap: it must return 200, text/event-stream, and the
-    terminal `data: [DONE]` from the mock — exactly what the k6 phases check for.
+    /healthz does not exercise forwarding. This request must return 200,
+    text/event-stream, and the mock's terminal `data: [DONE]` marker.
     """
     body = {
         "model": "m",
@@ -177,6 +178,15 @@ def _per_stage_from_db() -> dict:
         rows = con.execute(
             "SELECT latency_total_ms, latency_upstream_ms, latency_inject_ms FROM requests"
         ).fetchall()
+        # Which guard backend ACTUALLY ran, per measured request. The gateway records the
+        # effective backend on every row, so this is observed rather than inferred from the
+        # launch command — and it can't go stale the way an inferred label can. It matters
+        # because the inject-scan figures are NOT backend-invariant: the regex baseline is
+        # sub-millisecond, the ONNX classifier is two orders of magnitude slower.
+        backends = dict(con.execute(
+            "SELECT COALESCE(guard_backend, '(unrecorded)'), COUNT(*) "
+            "FROM requests GROUP BY 1"
+        ).fetchall())
     finally:
         con.close()
     total = [r[0] for r in rows]
@@ -184,6 +194,7 @@ def _per_stage_from_db() -> dict:
     inject = [r[2] for r in rows]
     return {
         "rows": len(rows),
+        "guard_backends": backends,
         "total_ms": stats.summarize(total),
         "upstream_ms": stats.summarize(upstream),
         "inject_ms": stats.summarize(inject),

@@ -8,8 +8,8 @@ tokens — this script does NOT self-tally verdicts; the audit DB is the source 
 ⚠️ Point the cloud branch at a local mock (zero real egress) before running volume tests.
 Drains every SSE stream fully (no fire-and-forget early-close → no keepalive stubs).
 
-    uv run python -m eval.redteam.route_eval --agent route-eval            # full 150
-    uv run python -m eval.redteam.route_eval --agent route-eval-smoke --per-tier 1
+    uv run python -m eval.redteam route-eval --agent route-eval            # full 150
+    uv run python -m eval.redteam route-eval --agent route-eval-smoke --per-tier 1
 """
 
 from __future__ import annotations
@@ -21,8 +21,7 @@ from collections import Counter
 import httpx
 
 from . import loader
-
-GATEWAY = "http://127.0.0.1:4100"
+from .common import EVAL_CLOUD_MODEL, GATEWAY_URL
 
 
 def _items(per_tier: int | None):
@@ -41,9 +40,9 @@ def _items(per_tier: int | None):
 
 def _send(client: httpx.Client, agent: str, text: str) -> tuple[int, int]:
     """POST one item, DRAIN the stream fully. Returns (status, sse_data_lines)."""
-    url = f"{GATEWAY}/a/{agent}/v1/chat/completions"
+    url = f"{GATEWAY_URL}/a/{agent}/v1/chat/completions"
     payload = {
-        "model": "gemini-2.5-flash",  # documents the counterfactual cloud model
+        "model": EVAL_CLOUD_MODEL,  # documents the counterfactual cloud model
         "messages": [{"role": "user", "content": text}],
         "stream": True,
         "stream_options": {"include_usage": True},  # make oMLX emit a usage chunk to tap
@@ -58,16 +57,23 @@ def _send(client: httpx.Client, agent: str, text: str) -> tuple[int, int]:
     return status, lines
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--agent", default="route-eval", help="unpinned agent_id (NOT capture)")
-    ap.add_argument("--per-tier", type=int, default=None, help="cap items per tier (smoke test)")
-    ap.add_argument("--sleep", type=float, default=0.3, help="inter-request sleep (oMLX concurrency=1)")
-    args = ap.parse_args()
+def _add_args(p) -> None:
+    p.add_argument("--agent", default="route-eval", help="unpinned agent_id (NOT capture)")
+    p.add_argument("--per-tier", type=int, default=None, help="cap items per tier (smoke test)")
+    p.add_argument("--sleep", type=float, default=0.3, help="inter-request sleep (oMLX concurrency=1)")
 
+
+def register(sub) -> None:
+    """Register the `route-eval` subcommand on `python -m eval.redteam`."""
+    p = sub.add_parser("route-eval", help="drive the sensitivity corpus through a live gateway")
+    _add_args(p)
+    p.set_defaults(fn=main)
+
+
+def main(args) -> None:
     items = _items(args.per_tier)
     by_tier = Counter(it.sensitivity for it in items)
-    print(f"driving {len(items)} items through {GATEWAY}/a/{args.agent} — tiers {dict(by_tier)}")
+    print(f"driving {len(items)} items through {GATEWAY_URL}/a/{args.agent} — tiers {dict(by_tier)}")
     print("(sensitive→local oMLX generation; public→mock canned. Local tier dominates runtime.)")
 
     t0 = time.perf_counter()
@@ -92,5 +98,7 @@ def main() -> None:
     print(f"verify in the audit DB (read-only): query the requests table, filter agent_id={args.agent!r} and inspect route_provider / route_is_local")
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__":  # direct invocation delegates to the same main()
+    _ap = argparse.ArgumentParser(description=__doc__)
+    _add_args(_ap)
+    main(_ap.parse_args())

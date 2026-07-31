@@ -44,7 +44,13 @@ class MemoryBackend:
             exp = None
         if exp is None:
             exp = time.monotonic() + ttl_s
-        val += amount
+        # Rounded on accumulate: repeated `+=` in binary float drifts below the cap
+        # (ten increments of 0.10 land on 0.9999999999999999, so `spent >= 1.00` is
+        # False and the kill switch never arms). Six places is far under a cent, and it
+        # makes this backend agree with RedisBackend's decimal INCRBYFLOAT at the
+        # boundary — otherwise the same traffic trips the cap on Redis and silently
+        # does not on the in-process fallback make_backend selects when Redis is down.
+        val = round(val + amount, 6)
         self._vals[key] = (val, exp)
         return val
 

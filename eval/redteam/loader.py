@@ -19,13 +19,20 @@ RUNS_DIR = PKG_DIR / "runs"
 
 AUTHORED = CORPUS_DIR / "authored.jsonl"
 PUBLIC_DIR = CORPUS_DIR / "public"
-# FP-capture corpus. The live tap keeps the default file growing; set
-# AGENTGATE_FP_CAPTURE_PATH to point score/judge/report at a frozen snapshot
-# (e.g. a deduped+scrubbed freeze) without mutating or pausing the live tap.
-FP_CAPTURE = Path(_p) if (_p := os.environ.get("AGENTGATE_FP_CAPTURE_PATH")) else CORPUS_DIR / "fp_capture.jsonl"
+# FP-capture corpus. Two modes:
+#   default — the committed frozen snapshot, so a fresh clone runs offline with no setup;
+#   live tap — set AGENTGATE_FP_CAPTURE_PATH to the growing capture file (the path
+#   AGENTGATE_CAPTURE_PATH writes) to score/judge/report against traffic as it arrives,
+#   without mutating or pausing the tap.
+FP_CAPTURE = (
+    Path(_p) if (_p := os.environ.get("AGENTGATE_FP_CAPTURE_PATH"))
+    else CORPUS_DIR / "fp_capture.frozen.jsonl"
+)
+# The committed canonical gold set.
 GOLD_SET = CORPUS_DIR / "gold_set.jsonl"
-# The Streamlit labeler writes here by default; used as the gold set if the canonical
-# gold_set.jsonl isn't present, so labels feed the report without a rename step.
+# The Streamlit labeler writes here, and a fresh labeling round lands here first; it is
+# used as the gold set only if the canonical file is absent, so a new round feeds the
+# report without a rename step. Not committed — gold_set.jsonl is.
 GOLD_SET_LABELED = CORPUS_DIR / "gold_set_labeled.jsonl"
 SENSITIVITY_CORPUS = CORPUS_DIR / "sensitivity_corpus.jsonl"
 
@@ -107,7 +114,12 @@ def load_corpus(
 
 
 def resolve_gold_path() -> Path:
-    """Canonical gold_set.jsonl if present, else the labeler's gold_set_labeled.jsonl."""
+    """Canonical gold_set.jsonl if present, else the labeler's gold_set_labeled.jsonl.
+
+    The committed canonical file is ``gold_set.jsonl``; the fallback exists so a labeling
+    round in progress (``label_app.py`` writes the ``_labeled`` name) is picked up without
+    a rename.
+    """
     return GOLD_SET if GOLD_SET.exists() else GOLD_SET_LABELED
 
 

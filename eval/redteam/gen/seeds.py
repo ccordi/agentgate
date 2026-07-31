@@ -1,8 +1,8 @@
 """Seed intents for the seed-and-mutate harness — the *agent-specific* attack surface.
 
-These are deliberately aimed at the garak-evaluation finding (DeBERTa caught canonical/obfuscated
-injection but **missed indirect / document-embedded / tool-result injection**, latentinjection
-recall 0-42%). So the seeds describe *where the payload hides*, not just *what it says*:
+These target a gap in the garak evaluation: DeBERTa caught canonical and obfuscated
+injections but had 0–42% recall on indirect, document-embedded, and tool-result cases.
+The seeds describe where the payload appears as well as what it says:
 
   * ``doc_embedded``  — instruction buried in a long benign document the agent reads/summarizes
                         (the AgentDojo "indirect injection via processed data" shape).

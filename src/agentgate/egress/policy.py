@@ -5,7 +5,7 @@ existing-or-trivial signals — **no new detection code**:
 
 - In-scope test — is this tool call a network egress at all?
 - Destination axis — allowlisted vs. untrusted (loopback always allowed).
-- Payload axis — reuse `security.classifier.classify()` (regex, no LLM call).
+- Payload axis — reuse `sensitivity.classify()` (regex, no LLM call).
 - Decision matrix — allow / deny only (`allow_with_conditions` is reserved,
   unimplemented).
 """
@@ -18,10 +18,19 @@ from typing import Any
 
 import httpx
 
-from .classifier import Sensitivity, classify
+from agentgate.sensitivity import Sensitivity, classify
 
-# Mirrors classify_request's bound (20k chars) — see security/classifier.py.
-_MAX_PAYLOAD_CHARS = 20000
+# The window the payload is classified over. Padding past it hid a secret from the
+# sensitivity axis completely — 20 000 filler characters flipped deny to allow on a
+# non-allowlisted destination, which is the axis this PDP exists to enforce. It is now
+# set as wide as the classifier can scan cheaply rather than to match sensitivity.py:
+# the detection patterns are linear, so 1 MB costs ~95 ms of prose and ~460 ms of
+# pathological input. Still bounded — classification is not free, and an unbounded
+# window is its own denial of service.
+#
+# classify_request's own 20k default is deliberately untouched: widening the *inbound*
+# window changes what routes local vs cloud, which is a separate decision.
+_MAX_PAYLOAD_CHARS = 1_000_000
 
 # URL/host shape matcher. Matches `scheme://host[...]` or a bare `host:port`
 # (e.g. "internal.example:8443"). Deliberately small and explicit.
@@ -88,7 +97,7 @@ def _extract_host(url_or_host: str) -> str:
 
     For URL-form inputs (anything with a scheme) the host is parsed with **httpx** —
     the exact library the PEP uses to make the outbound request
-    (`pep/safe_http_request.py:_perform_outbound`). This is a security invariant, not
+    (`egress/pep.py:_perform_outbound`). This is a security invariant, not
     a convenience: the allowlist check and the actual connection MUST parse the
     destination identically, or a single crafted URL can make the PDP see an
     allowlisted host while httpx connects elsewhere. A hand-rolled parser that, e.g.,
@@ -129,6 +138,30 @@ def _extract_host(url_or_host: str) -> str:
 
 def _is_loopback(host: str) -> bool:
     return host in _LOOPBACK_HOSTS
+
+
+def is_loopback_host(value: str) -> bool:
+    """Whether a bind address or `Host` header value names the loopback interface.
+
+    The project-wide definition of "loopback" — the same `_LOOPBACK_HOSTS` set that
+    drives the destination axis above. One definition on purpose: if the startup bind
+    check and the egress policy ever disagreed about what counts as loopback (say,
+    `127.0.0.2`), the gap between them would be config-level comment-vs-code drift.
+    Anything outside the set is treated as non-loopback and handled strictly —
+    under-inclusion fails closed for both callers (a bind refuses to start; a Host
+    header is rejected).
+
+    Accepts the bare forms a bind config uses ("127.0.0.1", "::1") and the authority
+    forms a Host header uses ("127.0.0.1:4100", "[::1]:4100"). `0.0.0.0` is deliberately
+    NOT accepted — it binds every interface, and refusing that bind is the entire point
+    of the check (`validate_runtime_settings`). Do not "fix" this by adding it to
+    `_LOOPBACK_HOSTS`: that one edit reopens the wide bind and the DNS-rebinding Host
+    guard together. `test_startup_posture.py` pins the False.
+    """
+    s = value.strip().lower()
+    if s in _LOOPBACK_HOSTS:
+        return True
+    return _is_loopback(_extract_host(s))
 
 
 def _build_payload_text(arguments: dict[str, Any]) -> str:

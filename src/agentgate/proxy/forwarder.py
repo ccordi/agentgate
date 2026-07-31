@@ -18,7 +18,26 @@ from agentgate.proxy.streaming import StreamResult, StreamTap
 
 # Hop-by-hop and length/host headers we must not forward verbatim; httpx recomputes
 # the ones it needs for the new connection.
-_STRIP_REQUEST_HEADERS = {"host", "content-length", "connection", "accept-encoding"}
+#
+# The hop-by-hop set is RFC 7230 §6.1: these describe the *client-to-gateway* connection
+# and are meaningless — or actively harmful — on the gateway-to-upstream one. Forwarding
+# `transfer-encoding: chunked` alongside the `content-length` httpx computes is the
+# classic CL+TE desync pair, and the process shares one AsyncClient, so a desynced pooled
+# connection would contaminate other callers' requests rather than just the sender's.
+# `proxy-authorization` is the client's own proxy credential and has no business reaching
+# a model provider.
+#
+# `content-encoding` is not here because it is already gone by this point: `new_call`
+# decompresses the body and pops the header off the request it hands us, and rejects the
+# request outright when it cannot decode what the header declares. So there is never a
+# compressed body to describe here — a static entry would be stripping a header that the
+# only bodies reaching this function do not carry.
+_STRIP_REQUEST_HEADERS = {
+    "host", "content-length", "accept-encoding",
+    # RFC 7230 §6.1 hop-by-hop
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailer", "transfer-encoding", "upgrade",
+}
 _STRIP_RESPONSE_HEADERS = {"content-length", "content-encoding", "transfer-encoding", "connection"}
 
 
@@ -67,11 +86,20 @@ async def forward_stream(
     """
     url = build_upstream_url(provider)
     headers = prepare_headers(inbound_headers, provider)
-    tap = StreamTap()
 
     async with client.stream(
         "POST", url, headers=headers, content=body, timeout=timeout_s
     ) as resp:
+        # Everything is piped through the tap, streamed or not. A client that omits
+        # `stream` — which is OpenAI's default — gets a single JSON completion back, and
+        # the SSE line parser finds no `data:` prefix in it, so usage never lands and the
+        # request accrues zero spend.
+        content_type = (resp.headers.get("content-type") or "").lower()
+        # A declared SSE stream is taken at its word; anything else — including no header
+        # at all — is decided from the first bytes. Trusting the header alone made the
+        # accounting depend on it: an upstream that streams SSE without saying so, or
+        # labels it `application/json`, metered nothing and accrued no spend.
+        tap = StreamTap(sse=True if "text/event-stream" in content_type else None)
         out_headers = {
             k: v for k, v in resp.headers.items() if k.lower() not in _STRIP_RESPONSE_HEADERS
         }

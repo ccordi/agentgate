@@ -4,7 +4,7 @@ title: agentgate
 
 # Benchmarks — agentgate gateway
 
-> Generated 2026-06-17 16:14 UTC by `uv run python -m bench.run`. Deterministic mock upstream; single-box (one uvicorn worker), loopback.
+> Generated 2026-07-28 14:49 UTC by `uv run python -m bench.run`. Deterministic mock upstream; single-box (one uvicorn worker), loopback.
 
 ## Methodology
 
@@ -36,25 +36,28 @@ All times in **ms**. Offered load is k6's target arrival rate; achieved rps is w
 
 | phase | offered rps | achieved rps | fail% | p50 | p90 | p95 | p99 | max | TTFB p99 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| gw rate 50 | 50 | 50.0 | 0.00% | 6.34 | 8.18 | 8.87 | 10.47 | 14.05 | 9.62 |
-| gw rate 100 | 100 | 100.0 | 0.00% | 3.72 | 4.75 | 5.90 | 7.91 | 15.86 | 7.20 |
-| gw rate 200 | 200 | 200.0 | 0.00% | 2.42 | 2.77 | 2.89 | 3.37 | 10.97 | 3.02 |
-| gw large 100 | 100 | 100.0 | 0.00% | 4.10 | 4.65 | 4.83 | 6.55 | 39.04 | 5.95 |
-| baseline rate 100 | 100 | 100.0 | 0.00% | 1.96 | 2.68 | 2.96 | 4.49 | 7.68 | 4.28 |
+| gw rate 50 | 50 | 50.1 | 0.00% | 3.37 | 3.86 | 4.02 | 4.22 | 4.94 | 3.85 |
+| gw rate 100 | 100 | 100.1 | 0.00% | 2.31 | 2.51 | 2.59 | 2.82 | 5.54 | 2.53 |
+| gw rate 200 | 200 | 200.0 | 0.00% | 1.78 | 1.99 | 2.10 | 2.48 | 8.34 | 2.20 |
+| gw large 100 | 100 | 100.0 | 0.00% | 2.89 | 3.18 | 3.30 | 3.53 | 4.99 | 3.24 |
+| baseline rate 100 | 100 | 100.1 | 0.00% | 0.86 | 1.91 | 2.56 | 3.35 | 4.71 | 3.23 |
 
 *`gw large` adds a 4 KB `role:"tool"` block to exercise the inbound injection scan; compare it to `gw 100` to see the scan's marginal cost.*
 
 
 ## Gateway overhead
 
-The gateway's own added latency — measured server-side and isolated from the upstream — is **1.48 ms p95 (1.70 ms p99)** across 5404 requests (parse + inject-scan + spend check + SSE tee + fire-and-forget audit dispatch). This is the floor the proxy adds regardless of which guard backend is enabled.
+The gateway's own added latency — measured server-side and isolated from the upstream — is **1.00 ms p95 (1.06 ms p99)** across 5404 requests (parse + inject-scan + spend check + SSE tee + fire-and-forget audit dispatch).
 
-> The client-side end-to-end subtraction — gateway p99 **7.91 ms** minus direct-to-mock baseline p99 **4.49 ms** → **3.42 ms** — is **not** a reliable overhead measure here: the gateway's cost is below the loopback baseline's run-to-run variance, so this difference is noise-dominated and can come out negative. Use the per-stage decomposition below.
+
+> **Guard backend actually measured: `heuristic` (5404/5404)**, read from the `guard_backend` column of the audit rows this run produced. The inbound scan measured here is the **regex baseline**, not the DeBERTa classifier — which is why the `inject scan` row below is sub-millisecond. This overhead figure is **not** backend-invariant; a model-backed guard costs orders of magnitude more per scanned item.
+
+> The client-side end-to-end subtraction — gateway p99 **2.82 ms** minus direct-to-mock baseline p99 **3.35 ms** → **-0.53 ms** — is **not** a reliable overhead measure here: the gateway's cost is below the loopback baseline's run-to-run variance, so this difference is noise-dominated and can come out negative. Use the per-stage decomposition below.
 
 
 ## Streaming overhead
 
-At 100 rps, p99 TTFB **7.20 ms** vs. full-stream p99 **7.91 ms** → the SSE body (deterministic short completion) adds **≈ 0.71 ms** of stream-receive time. The gateway never buffers the stream — chunks are teed through as they arrive.
+At 100 rps, p99 TTFB **2.53 ms** vs. full-stream p99 **2.82 ms** → the SSE body (deterministic short completion) adds **≈ 0.29 ms** of stream-receive time. The gateway never buffers an SSE stream — chunks are teed through as they arrive. (A non-streaming response has no incremental framing, so it is buffered to a cap to read its usage; that path is not what this figure measures.)
 
 
 ## Per-stage latency (server-side, all gateway requests)
@@ -63,17 +66,46 @@ From the gateway's audit DB (5404 requests). `inject` is the inbound scan; `upst
 
 | stage | n | p50 | p95 | p99 | max |
 | --- | --- | --- | --- | --- | --- |
-| inject scan | 5404 | 0.01 | 0.38 | 0.43 | 4.58 |
-| upstream (mock) | 5404 | 1.98 | 4.81 | 6.15 | 11.73 |
-| gateway internal | 5404 | 0.13 | 1.48 | 1.70 | 5.59 |
-| total | 5404 | 2.48 | 5.15 | 6.64 | 12.00 |
+| inject scan | 5404 | 0.01 | 0.25 | 0.27 | 0.39 |
+| upstream (mock) | 5404 | 1.42 | 2.43 | 2.78 | 7.92 |
+| gateway internal | 5404 | 0.10 | 1.00 | 1.06 | 1.16 |
+| total | 5404 | 1.71 | 2.68 | 3.00 | 8.25 |
+
+## Is this one run representative?
+
+The tables above are a single `bench.run`. One run can't tell you whether its numbers are
+typical, so the gateway-overhead figure was re-measured at **N=6** on 2026-07-28 — six
+full runs, each ~5,400 gateway requests, every replicate DB kept and re-percentiled with
+`bench.stats` (the same code that renders the tables):
+
+| replicate | n | gateway internal p95 | p99 |
+| --- | --- | --- | --- |
+| 1 | 5403 | 0.95 | 1.02 |
+| 2 | 5403 | 1.00 | 1.05 |
+| 3 | 5403 | 1.01 | 1.07 |
+| 4 | 5402 | 1.04 | 1.09 |
+| 5 | 5404 | 1.00 | 1.06 |
+| 6 | 5401 | 0.95 | 1.00 |
+| **median** | | **1.00** | **1.06** |
+
+Spread is about ±4%. The tables above use replicate 5, which is at the median on both
+percentiles. Every replicate ran the `heuristic` backend, confirmed per request from the
+audit rows.
+
+**This supersedes an earlier figure.** Through 2026-07-27 this document reported **1.48 ms
+p95 / 1.70 ms p99** from a 2026-06-17 run. That pair does not reproduce: it sits outside
+the range of all six replicates, 43% above the highest one. No artifact from the original
+run survived, so the cause cannot be traced. The new replicates still support sub-2 ms
+proxy overhead with the regex guard; the earlier pair should not be quoted.
+
+The six-run spread is what shows that 1.48 ms is outside the reproduced distribution.
+
 
 ## Deferred
 
-- **Routing overhead** — the sensitivity classifier + rules-table router are not yet implemented; this harness leaves a slot for a router-on/off comparison (and a `latency_classify_ms` / `latency_route_ms` per-stage row) once they exist.
+- **Routing overhead** — the sensitivity classifier and rules-table router ship and run on every request, but this harness does not yet **benchmark** them separately: it leaves a slot for a router-on/off comparison and a `latency_classify_ms` per-stage row (the column exists in the audit schema and is never populated).
 
 - **Real local-model upstream** — the mock is the reproducible baseline; a real omlx/llama.cpp run is an optional later comparison once a model is pulled.
 
 
 > Caveats: single machine, one uvicorn worker, loopback (no real network RTT). The **server-side per-stage** figures are the gateway's own cost; the end-to-end percentiles include upstream + transport and are not end-user latency to a cloud provider.
-

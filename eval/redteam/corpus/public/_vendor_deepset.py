@@ -23,6 +23,10 @@ DATASET = "deepset/prompt-injections"
 API = "https://datasets-server.huggingface.co/rows"
 OUT = Path(__file__).resolve().parent / "deepset_prompt_injections.jsonl"
 PAGE = 100
+# The pinned snapshot, as recorded in SOURCES.md. A re-fetch that doesn't reproduce this
+# means the upstream dataset moved — the committed corpus (and every number measured
+# against it) is then stale, which should be loud, not silent.
+EXPECTED_SHA256 = "3febc62f6b7bdc5b7f0b44844e7f6a2085f3abed94e057f6d602c2740ea331b6"
 
 
 def _fetch_split(client: httpx.Client, split: str) -> list[CorpusItem]:
@@ -57,6 +61,13 @@ def main() -> None:
     pos = sum(1 for i in items if i.label == 1)
     print(f"wrote {n} items ({pos} positives / {n - pos} negatives) → {OUT.name}")
     print(f"sha256: {sha}")
+    if sha != EXPECTED_SHA256:
+        raise SystemExit(
+            f"sha256 mismatch: got {sha}, SOURCES.md pins {EXPECTED_SHA256}.\n"
+            "The upstream dataset has changed. Do not silently adopt the new snapshot — "
+            "the published metrics were measured against the pinned one. Decide "
+            "deliberately, then update SOURCES.md and EXPECTED_SHA256 together."
+        )
 
 
 if __name__ == "__main__":

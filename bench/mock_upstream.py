@@ -4,6 +4,9 @@ Emits a deterministic OpenAI Chat Completions SSE stream — no token cost, no
 network — so the load benchmark measures pure gateway overhead (p99) and the
 forwarder/tap can be tested end-to-end. Mirrors the chunk shape of a real
 OpenAI-compatible streaming SSE response.
+
+Also imported by tests/support/upstream.py as the canonical SSE fixture — keep it
+dependency-light.
 """
 
 from __future__ import annotations
@@ -43,14 +46,26 @@ def _usage_chunk(prompt: int, completion: int) -> bytes:
     return f"data: {json.dumps(event)}\n\n".encode()
 
 
-async def canned_sse(tokens: list[str] | None = None) -> AsyncIterator[bytes]:
+def canned_chunks(tokens: list[str] | None = None) -> list[bytes]:
+    """The canonical chunk sequence: role delta, one delta per token, stop, usage, DONE."""
     tokens = tokens or DEFAULT_TOKENS
-    yield _chunk(delta={"role": "assistant", "content": ""}, finish_reason=None)
-    for tok in tokens:
-        yield _chunk(delta={"content": tok}, finish_reason=None)
-    yield _chunk(delta={}, finish_reason="stop")
-    yield _usage_chunk(prompt=11, completion=len(tokens))
-    yield b"data: [DONE]\n\n"
+    return [
+        _chunk(delta={"role": "assistant", "content": ""}, finish_reason=None),
+        *[_chunk(delta={"content": tok}, finish_reason=None) for tok in tokens],
+        _chunk(delta={}, finish_reason="stop"),
+        _usage_chunk(prompt=11, completion=len(tokens)),
+        b"data: [DONE]\n\n",
+    ]
+
+
+def canned_sse_bytes(tokens: list[str] | None = None) -> bytes:
+    """The same stream as one buffer — for callers that can't consume an async iterator."""
+    return b"".join(canned_chunks(tokens))
+
+
+async def canned_sse(tokens: list[str] | None = None) -> AsyncIterator[bytes]:
+    for chunk in canned_chunks(tokens):
+        yield chunk
 
 
 app = FastAPI(title="mock-upstream")

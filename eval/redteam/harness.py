@@ -1,15 +1,14 @@
-"""Scoring harness — run the scanner over the labeled corpus → honest metrics.
+"""Score an injection scanner over the labeled corpus.
 
-Drives the stable entry point ``agentgate.security.injection.scan_text`` (swaps to a
+Drives the stable entry point ``agentgate.guards.heuristic.scan_text`` (swaps to a
 different backend with no change here). Scores each item once, then evaluates at
-multiple thresholds so the report shows the recall/false-positive tradeoff rather than one
-cherry-picked operating point.
+multiple thresholds so the report shows the recall/false-positive tradeoff.
 
-Honesty notes baked in:
+Evaluation rules:
   * Recall is measured only over **labeled positives** (no circular self-labeling).
   * **False negatives** are first-class — and we separate *expected* misses (items tagged
     ``expected_miss``: known regex blind spots like base64/translation) from *surprise*
-    misses (plain positives that slipped through), since the latter are the real signal.
+    misses (plain positives that slipped through).
 """
 
 from __future__ import annotations
@@ -17,11 +16,13 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 
-from agentgate.security import injection
+from agentgate import guards
+from agentgate.guards import heuristic
 
+from .common import wilson_interval
 from .schema import CorpusItem
 
-# A detector is anything matching injection.scan_text: text -> Verdict (has .score/.reasons).
+# A detector is anything matching heuristic.scan_text: text -> Verdict (has .score/.reasons).
 ScanFn = Callable[[str], object]
 
 
@@ -32,7 +33,7 @@ class Scored:
     reasons: list[str]
 
 
-def score_corpus(items: list[CorpusItem], scan_fn: ScanFn = injection.scan_text) -> list[Scored]:
+def score_corpus(items: list[CorpusItem], scan_fn: ScanFn = heuristic.scan_text) -> list[Scored]:
     """Run a detector once per labeled item. Unlabeled items are skipped (no ground truth)."""
     out: list[Scored] = []
     for it in items:
@@ -55,7 +56,7 @@ class Confusion:
         return self.tp + self.fp + self.tn + self.fn
 
     @property
-    def recall(self) -> float:  # TPR — the headline catch-rate
+    def recall(self) -> float:  # true-positive rate
         d = self.tp + self.fn
         return self.tp / d if d else 0.0
 
@@ -116,8 +117,8 @@ def per_category_recall(scored: list[Scored], threshold: float) -> dict[str, dic
 def default_thresholds() -> list[float]:
     """Sweep points plus the scanner's configured flag/hard thresholds."""
     pts = {round(x / 10, 1) for x in range(1, 10)}
-    pts.add(injection.FLAG_THRESHOLD)
-    pts.add(injection.HARD_THRESHOLD)
+    pts.add(guards.FLAG_THRESHOLD)
+    pts.add(guards.HARD_THRESHOLD)
     return sorted(pts)
 
 
@@ -134,17 +135,17 @@ class RunResult:
         return asdict(self)
 
 
-def run(items: list[CorpusItem], scan_fn: ScanFn = injection.scan_text,
+def run(items: list[CorpusItem], scan_fn: ScanFn = heuristic.scan_text,
         detector: str = "heuristic") -> RunResult:
     """Full evaluation at the live operating point + threshold sweep + category breakdown."""
     scored = score_corpus(items, scan_fn)
-    op_t = injection.FLAG_THRESHOLD
+    op_t = guards.FLAG_THRESHOLD
 
     labeled = [s for s in scored]
     n_pos = sum(1 for s in labeled if s.item.label == 1)
     n_neg = sum(1 for s in labeled if s.item.label == 0)
 
-    # Real false negatives worth attention = missed positives NOT tagged expected_miss.
+    # Unanticipated false negatives are missed positives not tagged expected_miss.
     surprises = [
         # Flatten whitespace before truncating: keeps the preview to one line (embedded
         # newlines would otherwise break the markdown table) and spends the 160-char budget
@@ -155,15 +156,24 @@ def run(items: list[CorpusItem], scan_fn: ScanFn = injection.scan_text,
         if s.item.label == 1 and s.score < op_t and not s.item.meta.get("expected_miss")
     ]
 
-    # Did any "expected to be missed" evasions actually get caught? (taxonomy honesty)
+    # Count expected-miss evasions that were caught anyway.
     em = [s for s in scored if s.item.meta.get("expected_miss")]
     em_caught = sum(1 for s in em if s.score >= op_t)
+
+    # Wilson 95% intervals on recall and false-positive rate. Point estimates are unchanged;
+    # these say how much of the estimate the corpus actually supports. `None` when the
+    # denominator is empty (no positives, or no negatives, at this threshold).
+    op_conf = confusion_at(scored, op_t)
+    def _ci(k: int, n: int) -> list[float] | None:
+        return list(wilson_interval(k, n)) if n else None
 
     return RunResult(
         corpus={"total_labeled": len(labeled), "positives": n_pos, "negatives": n_neg,
                 "detector": detector,
                 "sources": sorted({s.item.source for s in scored})},
-        operating_point={"threshold": op_t, **confusion_at(scored, op_t).as_dict()},
+        operating_point={"threshold": op_t, **op_conf.as_dict(),
+                         "recall_ci_95": _ci(op_conf.tp, op_conf.tp + op_conf.fn),
+                         "fp_rate_ci_95": _ci(op_conf.fp, op_conf.fp + op_conf.tn)},
         sweep=[{"threshold": t, **confusion_at(scored, t).as_dict()} for t in default_thresholds()],
         per_category=per_category_recall(scored, op_t),
         missed_surprises=surprises,

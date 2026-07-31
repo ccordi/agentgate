@@ -28,22 +28,24 @@ proxy-captures/
 
 # Red-team eval: per-run outputs + judge cache (regenerated, not source)
 eval/redteam/runs/
-# FP-capture raw captures — local-only (arbitrary live web text); only curated items
-# get promoted into the committed corpus. See plan / brainstorm "raw content local-only".
+# FP-capture raw captures contain arbitrary live web text and stay local. Only reviewed
+# items belong in the committed corpus.
 eval/redteam/corpus/fp_capture.jsonl
-# Regenerable gold-set sampling template (the filled-in gold_set.jsonl IS committed)
+# Regenerable gold-set sampling template (`gold_set.jsonl` is committed)
 eval/redteam/corpus/gold_set_unlabeled.jsonl
+# The labeler's working output. A finished round gets promoted into gold_set.jsonl —
+# committing both just leaves two copies of the same file to drift apart.
+eval/redteam/corpus/gold_set_labeled.jsonl
 # Benchmark run artifacts (k6 summaries); bench DB is under data/ (already ignored)
 bench/runs/
 
 # other
 notes/
-# anchored + no trailing slash: ignores both the real models/ dir AND the
-# `models` symlink that spinoff worktrees create (a `models/` rule misses symlinks)
+# Anchored with no trailing slash so this covers both the directory and a symlink.
 /models
 tmp/
 
-# Spinoff worktrees (convention: git worktree add .worktrees/<name>) — never committed
+# Local worktrees
 .worktrees/
 # Local-only Claude permission overrides
 .claude/settings.local.json

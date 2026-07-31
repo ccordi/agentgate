@@ -13,7 +13,7 @@ Fail-closed: if the PDP is unreachable, times out, returns a non-2xx
 status, or returns an unparseable response, the call is **denied**. An
 availability blip on the PDP must never silently re-open the egress path.
 
-MCP wiring is provided by `pep/mcp_server.py`.
+MCP wiring is provided by `egress/mcp_server.py`.
 """
 
 from __future__ import annotations
@@ -91,7 +91,7 @@ def _build_pdp_request(
     context: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Build the PDP request body in the exact `EgressDecisionRequest` shape
-    (`agentgate.app.EgressDecisionRequest`)."""
+    (`agentgate.egress.api.EgressDecisionRequest`)."""
     arguments: dict[str, Any] = {"url": url, "method": method}
     if headers is not None:
         arguments["headers"] = headers
@@ -160,8 +160,8 @@ def safe_http_request(
         Timeout (seconds) for the outbound request, only used on `allow`.
     bearer:
         If provided, sent as `Authorization: Bearer <bearer>` to the PDP. The
-        PDP's auth is conditional (no-op if `AGENTGATE_LOCAL_API_KEY` is unset),
-        but sending a token when present is correct and forward-compatible.
+        PDP's auth is mandatory (`AGENTGATE_PDP_TOKEN`, dedicated); omitting the
+        bearer fails closed — the PDP 401s and no outbound request is made.
     context:
         Optional audit-correlation context (`agent_id`, `request_id`, `session`),
         passed through to the PDP verbatim.
@@ -177,32 +177,48 @@ def safe_http_request(
         real PDP verdict or fail-closed), `executed` is always `False` and the
         outbound HTTP request is never made.
     """
-    pdp_payload = _build_pdp_request(
-        url=url, method=method, headers=headers, body=body, context=context
-    )
-
-    pdp_headers = {"content-type": "application/json"}
-    if bearer:
-        pdp_headers["authorization"] = f"Bearer {bearer}"
-
-    owns_pdp_client = pdp_client is None
-    http_pdp_client = pdp_client or httpx.Client(timeout=pdp_timeout)
+    # --- Pre-PDP guard -----------------------------------------------------------------
+    # Nothing in this region may escape as an exception. The MCP shell catches broadly and
+    # reports "egress permitted by policy, but the outbound request failed" — true for a
+    # post-verdict failure, and a lie for anything that happens BEFORE the PDP was ever
+    # consulted (e.g. httpx.InvalidURL on a malformed AGENTGATE_PDP_URL, which is not an
+    # HTTPError subclass and so slipped past the handlers below). Nothing egressed in that
+    # case, but telling the model policy permitted it invites a retry on another path.
+    # Converting every pre-verdict failure into an explicit fail-closed deny here makes the
+    # shell's carry-note true by construction, rather than by a sentinel it has to check.
     try:
+        pdp_payload = _build_pdp_request(
+            url=url, method=method, headers=headers, body=body, context=context
+        )
+
+        pdp_headers = {"content-type": "application/json"}
+        if bearer:
+            pdp_headers["authorization"] = f"Bearer {bearer}"
+
+        owns_pdp_client = pdp_client is None
+        http_pdp_client = pdp_client or httpx.Client(timeout=pdp_timeout)
         try:
-            response = http_pdp_client.post(
-                pdp_url, json=pdp_payload, headers=pdp_headers, timeout=pdp_timeout
-            )
-        except httpx.TimeoutException as exc:
-            return _fail_closed("fail-closed:timeout", f"PDP request timed out: {exc}")
-        except httpx.ConnectError as exc:
-            return _fail_closed(
-                "fail-closed:unreachable", f"PDP unreachable (connection refused): {exc}"
-            )
-        except httpx.HTTPError as exc:
-            return _fail_closed("fail-closed:transport-error", f"PDP request failed: {exc}")
-    finally:
-        if owns_pdp_client:
-            http_pdp_client.close()
+            try:
+                response = http_pdp_client.post(
+                    pdp_url, json=pdp_payload, headers=pdp_headers, timeout=pdp_timeout
+                )
+            except httpx.TimeoutException as exc:
+                return _fail_closed("fail-closed:timeout", f"PDP request timed out: {exc}")
+            except httpx.ConnectError as exc:
+                return _fail_closed(
+                    "fail-closed:unreachable", f"PDP unreachable (connection refused): {exc}"
+                )
+            except httpx.HTTPError as exc:
+                return _fail_closed("fail-closed:transport-error", f"PDP request failed: {exc}")
+        finally:
+            if owns_pdp_client:
+                http_pdp_client.close()
+    except Exception as exc:  # noqa: BLE001 — fail closed on anything pre-verdict
+        return _fail_closed(
+            "fail-closed:pep-error",
+            f"PEP failed before the PDP was consulted ({type(exc).__name__}: {exc}); "
+            f"nothing was sent",
+        )
 
     if response.status_code < 200 or response.status_code >= 300:
         return _fail_closed(
@@ -248,7 +264,10 @@ def safe_http_request(
             conditions=conditions,
         )
 
-    # decision == "allow" -> perform the actual outbound request.
+    # decision == "allow" -> perform the actual outbound request. Everything above this
+    # line is guaranteed not to raise (see the pre-PDP guard), so any exception escaping
+    # this function is post-verdict — which is what makes the MCP shell's carry-note
+    # ("permitted by policy, but the outbound request failed") a true statement.
     outbound = _perform_outbound(
         url=url,
         method=method,

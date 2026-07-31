@@ -1,7 +1,15 @@
-"""Unit tests for the sensitivity corpus."""
+"""Data-integrity tests for the committed sensitivity corpus.
+
+Pins the agreement between the committed JSONL and the generator that produces it — tier
+sizes, per-tier field shape, and the planted-secret spans. It does NOT re-run the
+generator (that is `gen sensitivity`'s own byte-diff check); it asserts that what is on
+disk still matches what the generator's constants say should be there, so an edited corpus
+or a drifted generator shows up as a test failure rather than a silently wrong eval.
+"""
 
 from __future__ import annotations
 
+from eval.redteam.gen.sensitivity_corpus import TIER_SIZE, TIERS
 from eval.redteam.loader import SENSITIVITY_CORPUS, load_jsonl
 
 
@@ -10,15 +18,15 @@ def test_sensitivity_corpus_exists_and_loads():
     assert SENSITIVITY_CORPUS.is_file()
 
     items = list(load_jsonl(SENSITIVITY_CORPUS))
-    assert len(items) == 150, f"Expected 150 items in corpus, got {len(items)}"
+    expected_total = TIER_SIZE * len(TIERS)
+    assert len(items) == expected_total, f"Expected {expected_total} items in corpus, got {len(items)}"
 
-    public_items = [i for i in items if i.sensitivity == "public"]
-    sensitive_doc_items = [i for i in items if i.sensitivity == "sensitive_doc"]
-    secret_bearing_items = [i for i in items if i.sensitivity == "secret_bearing"]
-
-    assert len(public_items) == 50, f"Expected 50 public items, got {len(public_items)}"
-    assert len(sensitive_doc_items) == 50, f"Expected 50 sensitive_doc items, got {len(sensitive_doc_items)}"
-    assert len(secret_bearing_items) == 50, f"Expected 50 secret_bearing items, got {len(secret_bearing_items)}"
+    by_tier = {t: [i for i in items if i.sensitivity == t] for t in TIERS}
+    for tier, tier_items in by_tier.items():
+        assert len(tier_items) == TIER_SIZE, (
+            f"Expected {TIER_SIZE} {tier} items, got {len(tier_items)}"
+        )
+    public_items, sensitive_doc_items, secret_bearing_items = (by_tier[t] for t in TIERS)
 
     for i in items:
         assert i.source == "sensitivity_corpus"

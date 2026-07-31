@@ -1,22 +1,24 @@
 """Sensitivity-classifier validation + over-fire measurement (offline).
 
-Deterministic, offline, re-runnable. NO LLM, NO network, NO DB writes. Run it with:
+Deterministic and offline: no LLM, network access, or database writes. Run it with:
 
-    uv run python -m eval.redteam.classifier_eval          # full report
-    uv run python -m eval.redteam.classifier_eval --json   # machine-readable
+    uv run python -m eval.redteam classifier-eval          # full report
+    uv run python -m eval.redteam classifier-eval --json   # machine-readable
 
 Two halves:
 
-  1. OVER-FIRE on REAL public content. Run classify() over every real OSS capture
-     (fp_capture.jsonl, expected sensitivity = none). Every non-none verdict is
-     an over-fire. Reported by resulting class and by firing hit_type, WITH the exact
+  1. Over-fire on public content. Run classify() over every OSS capture
+     (`loader.FP_CAPTURE` — the committed frozen snapshot unless
+     AGENTGATE_FP_CAPTURE_PATH points elsewhere; expected sensitivity = none). Every non-none verdict is
+     an over-fire. Reported by resulting class and firing hit_type, with the exact
      offending substring so each is root-causable to (a) correct-detect/blunt-policy vs
      (b) genuine detector false-positive.
 
-  2. DETECTION-FLOOR consistency check on the synthetic sensitivity corpus. ⚠️ This is
-     CIRCULAR: the generator asserted every item against this same classify()/detect(), so
-     the agreement is true BY CONSTRUCTION and is NOT independent validation. The public
-     tier is OFF-LIMITS for any false-positive claim. Reported here only as a sanity floor.
+  2. Detection-floor consistency check on the synthetic sensitivity corpus. The
+     generator asserted every item against the same classify()/detect() functions, so
+     agreement is true by construction and is not independent validation. Do not use
+     the public tier for false-positive claims; it is reported only as a consistency
+     check.
 
 The audit DB is read READ-ONLY (sqlite3 immutable URI) purely to corroborate that the
 offline over-fire reflects live behaviour; it is skipped cleanly if the DB is absent.
@@ -28,54 +30,54 @@ import argparse
 import json
 import sqlite3
 from collections import Counter
-from pathlib import Path
 
-from agentgate.security.classifier import classify
-from agentgate.security.redaction import (
-    _B64_BLOB_RE,
-    _ENTROPY_BITS,
-    _PII_PATTERNS,
-    _SECRET_PATTERNS,
-    _TOKEN_RE,
-    _is_b64_secret,
-    _shannon_bits,
-)
+from agentgate.redaction import explain
+from agentgate.sensitivity import classify
 
 from . import loader
+from .common import REPO_ROOT
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-_DB_PATH = _REPO_ROOT / "data" / "agentgate.db"  # not bundled; section [3] skipped if absent
+_DB_PATH = REPO_ROOT / "data" / "agentgate.db"  # not bundled; section [3] skipped if absent
 
 # Tier (`sensitivity` field) -> the classifier class it is constructed to produce.
 _TIER_EXPECT = {"public": "none", "sensitive_doc": "pii", "secret_bearing": "secret"}
 
-# Map a firing hit_type to the detector that produced it, so we can pull the exact
-# offending substring out of an over-firing text for root-causing.
-_HIT_RE = {name: pat for pat, name in (*_SECRET_PATTERNS, *_PII_PATTERNS)}
-
 
 def _offenders(text: str, hit_type: str) -> list[str]:
-    """Return the literal substring(s) that caused `hit_type` to fire in `text`."""
+    """Return the literal substring(s) that caused `hit_type` to fire in `text`.
+
+    `redaction.explain` owns the which-detector-fired-on-what walk; this only decides
+    how to render it. Entropy hits print bare (the token *is* the evidence); pattern hits
+    print with surrounding context, so a match can be judged as correct-detect vs
+    genuine false-positive without opening the capture.
+    """
+    spans = [s for t, s in explain(text) if t == hit_type]
     if hit_type == "high_entropy_token":
-        # detect() flags this via TWO branches; mirror both so the offender is never
-        # blank: (a) a generic alnum/_/- run over the entropy floor, and (b) a base64
-        # blob carrying `+`/`/` (e.g. `nv/<hex>`) that _is_b64_secret accepts.
-        a = [t for t in _TOKEN_RE.findall(text) if _shannon_bits(t) >= _ENTROPY_BITS]
-        b = [t for t in _B64_BLOB_RE.findall(text) if _is_b64_secret(t)]
-        return (a + b)[:3]
-    pat = _HIT_RE.get(hit_type)
-    if pat is None:
-        return []
+        return spans[:3]
     out = []
-    for m in pat.finditer(text):
-        s, e = m.span()
+    cursor = 0
+    for span in spans[:3]:
+        # explain() yields one pattern's matches in textual order, so a forward-only
+        # cursor recovers each match's real position (repeated identical spans included).
+        s = text.find(span, cursor)
+        if s < 0:  # unreachable in practice; degrade to the bare span rather than crash
+            out.append(repr(span))
+            continue
+        e = s + len(span)
+        cursor = e
         ctx = text[max(0, s - 25): e + 25].replace("\n", " ")
-        out.append(f"{m.group(0)!r}  …in: …{ctx}…")
-    return out[:3]
+        out.append(f"{span!r}  …in: …{ctx}…")
+    return out
 
 
 def measure_overfire() -> dict:
     """classify() over every real OSS capture; expected sensitivity = none."""
+    if not loader.FP_CAPTURE.exists():
+        raise SystemExit(
+            f"no FP capture corpus at {loader.FP_CAPTURE}; point "
+            "AGENTGATE_FP_CAPTURE_PATH at a capture file, or unset it to use the "
+            "committed frozen snapshot."
+        )
     items = list(loader.load_jsonl(loader.FP_CAPTURE))
     by_class: Counter = Counter()
     by_hit: Counter = Counter()
@@ -159,7 +161,7 @@ def _print_report(of: dict, floor: dict, db: dict | None) -> None:
     p("SENSITIVITY CLASSIFIER VALIDATION (offline, deterministic)")
     p("=" * 72)
 
-    p("\n[1] OVER-FIRE on REAL public content  (fp_capture.jsonl)")
+    p(f"\n[1] OVER-FIRE on REAL public content  ({loader.FP_CAPTURE.name})")
     p(f"    expected sensitivity = none for all {of['n']} captures")
     p(f"    over-fires: {of['overfires']}/{of['n']} = {of['rate'] * 100:.1f}%")
     p(f"    by resulting class : {of['by_class'] or '{}'}")
@@ -193,11 +195,14 @@ def _print_report(of: dict, floor: dict, db: dict | None) -> None:
     p("")
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--json", action="store_true", help="emit machine-readable JSON")
-    args = ap.parse_args()
+def register(sub) -> None:
+    """Register the `classifier-eval` subcommand on `python -m eval.redteam`."""
+    p = sub.add_parser("classifier-eval", help="sensitivity-classifier over-fire report (offline)")
+    p.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    p.set_defaults(fn=main)
 
+
+def main(args) -> None:
     of = measure_overfire()
     floor = detection_floor()
     db = db_corroboration()
@@ -209,5 +214,7 @@ def main() -> None:
         _print_report(of, floor, db)
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__":  # direct invocation delegates to the same main()
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    main(ap.parse_args())

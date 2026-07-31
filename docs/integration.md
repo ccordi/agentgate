@@ -4,7 +4,7 @@ title: agentgate
 
 # Integration guide
 
-agentgate is an OpenAI/Anthropic-compatible reverse proxy. You integrate it by pointing
+agentgate is an OpenAI-compatible reverse proxy (Chat Completions). You integrate it by pointing
 your tool's **model base URL** at the gateway (`http://127.0.0.1:4100` by default) — no
 change to the model, and usually a one-line change to the tool.
 
@@ -19,26 +19,30 @@ Both assume the gateway is running:
 
 ```bash
 uv sync
+export AGENTGATE_ADMIN_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+export AGENTGATE_PDP_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
 uv run --extra guard agentgate      # serves on http://127.0.0.1:4100
 ```
 
 (`--extra guard` enables the DeBERTa scanner; plain `uv run agentgate` falls back to the
-heuristic guard.)
+heuristic guard.) Both tokens are required — the gateway refuses to start without them, and
+they must be distinct; see the table below and `.env.example`.
 
 ## agentgate env vars you'll touch
 
 Set these in the gateway's environment or a `.env` file (prefix `AGENTGATE_`; nested keys
-use `__`). Full list with inline docs in [`src/agentgate/config.py`](https://github.com/ccordi/agentgate/blob/main/src/agentgate/config.py).
+use `__`). Full list with inline docs in `src/agentgate/config.py`.
 
 | Variable | Purpose |
 |---|---|
 | `AGENTGATE_DEFAULT_PROVIDER` | Upstream the gateway forwards to: `gemini`, `openai`, `ollama`, `local`. |
-| `AGENTGATE_GUARD_BACKEND` | Injection-guard backend: `deberta` (default; needs `--extra guard`) or `heuristic`. |
+| `AGENTGATE_GUARD_BACKEND` | Injection-guard backend: `deberta` (default; needs `--extra guard`), `heuristic`, `llm` (local-LLM guard, tool output only), or `combined`. |
 | `AGENTGATE_ROUTING__ENABLED` | Sensitivity-aware routing on/off (default on). |
 | `AGENTGATE_REDACTION_ENABLED` | Outbound secret/PII redaction on cloud egress (default on). |
 | `AGENTGATE_LOCAL_MODEL_OVERRIDE` | Model name forced on the local route (sensitive content). |
 | `AGENTGATE_EGRESS__ALLOWLIST` | JSON array of destinations the egress PDP treats as safe, e.g. `["api.github.com"]`. |
-| `AGENTGATE_LOCAL_API_KEY` | Bearer the egress PEP presents to the PDP (see §2). |
+| `AGENTGATE_ADMIN_TOKEN` | Bearer for the admin plane (`/admin/kill/*`). **Required** — the gateway refuses to start without it. |
+| `AGENTGATE_PDP_TOKEN` | Bearer the egress PEP presents to the PDP (see §2). **Required**, and dedicated — not the local upstream's `AGENTGATE_LOCAL_API_KEY`. |
 
 Auth to the real upstream is **passed through** from the inbound request — the gateway
 doesn't store provider keys. Put your real provider key in the *client's* config (below);
@@ -116,11 +120,15 @@ Register the server in `~/.continue/config.yaml`:
 mcpServers:
   - name: egress-gateway
     command: uv
-    args: [run, "--extra", egress-mcp, python, "-m", agentgate.pep.mcp_server]
+    args: [run, "--extra", egress-mcp, python, "-m", agentgate.egress.mcp_server]
     cwd: /path/to/agentgate          # where you cloned this repo
     env:
-      AGENTGATE_LOCAL_API_KEY: ${AGENTGATE_LOCAL_API_KEY}   # presented to the PDP as bearer
+      AGENTGATE_PDP_TOKEN: ${{ secrets.AGENTGATE_PDP_TOKEN }}  # PDP bearer
 ```
+
+Put `AGENTGATE_PDP_TOKEN=...` in `~/.continue/.env`, the workspace `.env`, or the
+workspace `.continue/.env`; Continue resolves the `secrets` placeholder before starting
+the MCP server.
 
 Exclude the built-in network paths in `~/.continue/permissions.yaml` (or at launch with
 `cn --exclude Fetch --exclude "Bash(curl*)" …`):
@@ -135,10 +143,10 @@ exclude:
   - Fetch
 ```
 
-With those excluded, the agent's only way out is the `safe_http_request` tool, which
-consults the gateway's PDP (`POST http://127.0.0.1:4100/a/egress/decision`) before each
-call. The PDP allows or denies by **destination allowlist** (`AGENTGATE_EGRESS__ALLOWLIST`)
-and **payload sensitivity**, and the PEP fails closed if the PDP is unreachable.
+With those tools excluded, `safe_http_request` is the configured HTTP path. It consults
+the gateway's PDP (`POST http://127.0.0.1:4100/a/egress/decision`) before each call. The
+PDP allows or denies by **destination allowlist** (`AGENTGATE_EGRESS__ALLOWLIST`) and
+**payload sensitivity**, and the PEP fails closed if the PDP is unreachable.
 
 > **This is cooperative enforcement, not a sandbox.** The `Bash(curl*)` rules match the
 > command's first token, so a shell wrapper (`sh -c 'curl …'`) starts with `sh` and slips
@@ -150,6 +158,5 @@ and **payload sensitivity**, and the PEP fails closed if the PDP is unreachable.
 
 ← Back to the [agentgate overview](index.md).
 
-See also the [README](https://github.com/ccordi/agentgate/blob/main/README.md) quickstart and
-[`src/agentgate/config.py`](https://github.com/ccordi/agentgate/blob/main/src/agentgate/config.py)
+See also the `README.md` quickstart and `src/agentgate/config.py`
 for the full settings reference.

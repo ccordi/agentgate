@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """OSS Content Traffic Generator.
 
-Drives a local agentgate gateway (default: http://127.0.0.1:4100) with realistic
-untrusted content and known-positives to measure recall, FP rate, and latency.
-Configure GATEWAY_URL below (or override via environment) to point at your instance.
+Drives a local agentgate gateway (``common.GATEWAY_URL``) with realistic untrusted
+content and known-positives to measure recall, FP rate, and latency. Override the target
+with AGENTGATE_EVAL_GATEWAY_URL.
+
+This is a **traffic driver, not a corpus producer** — its item dicts stay plain dicts on
+purpose. What it emits is requests; the corpus of record is what the gateway's capture tap
+writes on the far side (`AGENTGATE_CAPTURE_PATH`), already in `CorpusItem` shape.
 """
 from __future__ import annotations
 
@@ -13,12 +17,12 @@ import os
 import random
 import re
 import time
-from pathlib import Path
 
 import httpx
 
-# Configuration
-GATEWAY_URL = "http://127.0.0.1:4100"
+from .common import EVAL_CLOUD_MODEL, GATEWAY_URL
+from .loader import RUNS_DIR
+
 REPOS = [
     "jundot/omlx",
     "NVIDIA/garak",
@@ -28,8 +32,7 @@ REPOS = [
     "semgrep/semgrep",
 ]
 
-CACHE_FILE = Path("tmp/github_cache.json")
-SECRETS_FILE = Path("tmp/secrets.env")
+CACHE_FILE = RUNS_DIR / "github_cache.json"
 
 
 def get_github_headers() -> dict[str, str]:
@@ -37,15 +40,9 @@ def get_github_headers() -> dict[str, str]:
         "Accept": "application/vnd.github.v3+json",
         "User-Agent": "agentgate-traffic-gen",
     }
+    # Unauthenticated works (with tighter rate limits). For a token, use direnv or the
+    # repo `.env` — this script does not read credential files of its own.
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GITHUB_PAT")
-    if not token and SECRETS_FILE.exists():
-        with open(SECRETS_FILE) as f:
-            for line in f:
-                if "=" in line and not line.strip().startswith("#"):
-                    k, v = line.strip().split("=", 1)
-                    if k.strip() in ("GITHUB_TOKEN", "GITHUB_PAT"):
-                        token = v.strip().strip('"').strip("'")
-                        break
     if token:
         headers["Authorization"] = f"Bearer {token}"
         print("Using GitHub token for authentication.")
@@ -78,7 +75,7 @@ def fetch_repo_data(owner: str, repo: str, headers: dict[str, str]) -> dict:
     print(f"Fetching GitHub data for {repo_name}...")
     client = httpx.Client(timeout=15.0, follow_redirects=True)
 
-    # 1. Get default branch
+    # Default branch
     repo_url = f"https://api.github.com/repos/{repo_name}"
     r = client.get(repo_url, headers=headers)
     if r.status_code != 200:
@@ -86,7 +83,7 @@ def fetch_repo_data(owner: str, repo: str, headers: dict[str, str]) -> dict:
     repo_info = r.json()
     default_branch = repo_info.get("default_branch", "main")
 
-    # 2. Get README
+    # README
     readme_url = f"https://raw.githubusercontent.com/{repo_name}/{default_branch}/README.md"
     r = client.get(readme_url)
     readme_text = ""
@@ -95,7 +92,7 @@ def fetch_repo_data(owner: str, repo: str, headers: dict[str, str]) -> dict:
     else:
         print(f"  Warning: Failed to fetch README from {readme_url}: {r.status_code}")
 
-    # 3. Get Issues
+    # Issues and pull requests
     issues_url = f"https://api.github.com/repos/{repo_name}/issues?state=all&per_page=50"
     r = client.get(issues_url, headers=headers)
     issues = []
@@ -104,7 +101,7 @@ def fetch_repo_data(owner: str, repo: str, headers: dict[str, str]) -> dict:
     else:
         print(f"  Warning: Failed to fetch issues: {r.status_code}")
 
-    # 4. Get Comments
+    # Issue comments
     comments_url = f"https://api.github.com/repos/{repo_name}/issues/comments?per_page=50"
     r = client.get(comments_url, headers=headers)
     comments = []
@@ -262,8 +259,10 @@ def send_request(url: str, payload: dict, headers: dict[str, str]) -> dict:
                 }
     except Exception as e:
         duration = time.time() - start_time
+        # No HTTP response at all (connect/timeout). status_code is None so callers
+        # can tell "the gateway said something" from "the gateway said nothing".
         return {
-            "status_code": 999,
+            "status_code": None,
             "duration_ms": int(duration * 1000),
             "blocked": False,
             "error": str(e),
@@ -273,7 +272,7 @@ def send_request(url: str, payload: dict, headers: dict[str, str]) -> dict:
 
 def build_job_a_payload() -> dict:
     return {
-        "model": "gemini-3.1-flash-lite",
+        "model": EVAL_CLOUD_MODEL,
         "stream": True,
         "messages": [
             {"role": "system", "content": "You are a repo-digest assistant. Summarize the tool result."},
@@ -288,7 +287,7 @@ def build_job_a_payload() -> dict:
 
 def build_job_b_payload(repo: str, content: str) -> dict:
     return {
-        "model": "gemini-3.1-flash-lite",
+        "model": EVAL_CLOUD_MODEL,
         "stream": True,
         "messages": [
             {"role": "system", "content": "You are a repo-digest assistant. Summarize the tool result."},
@@ -301,17 +300,23 @@ def build_job_b_payload(repo: str, content: str) -> dict:
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(description="OSS Content Traffic Generator")
-    parser.add_argument("--smoke", action="store_true", help="Run in smoke test mode")
-    parser.add_argument("--volume", action="store_true", help="Run in volume test mode")
-    parser.add_argument("--limit", type=int, default=100, help="Volume test limit (default: 100)")
-    args = parser.parse_args()
+def _add_args(p) -> None:
+    p.add_argument("--smoke", action="store_true", help="Run in smoke test mode")
+    p.add_argument("--volume", action="store_true", help="Run in volume test mode")
+    p.add_argument("--limit", type=int, default=100, help="Volume test limit (default: 100)")
 
+
+def register(sub) -> None:
+    """Register the `traffic` subcommand on `python -m eval.redteam`."""
+    p = sub.add_parser("traffic", help="drive real OSS content through a live gateway")
+    _add_args(p)
+    p.set_defaults(fn=main)
+
+
+def main(args):
     if not args.smoke and not args.volume:
-        parser.error("Must specify either --smoke or --volume")
+        raise SystemExit("traffic: must specify either --smoke or --volume")
 
-    # Step 1: Populate cache
     cache = populate_cache_if_needed(REPOS)
 
     # Prepare gateway headers
@@ -320,7 +325,7 @@ def main():
         "Authorization": "Bearer eval-traffic-gen",
     }
 
-    # Step 2: Handle Job A (known-positives)
+    # Job A: known positives
     if args.smoke:
         print("\n=== Running Job A (Known-Positives to /a/known-positives) ===")
         job_a_payload = build_job_a_payload()
@@ -331,10 +336,10 @@ def main():
             print(f"Sending Job A request {i+1}/10... ", end="", flush=True)
             res = send_request(job_a_url, job_a_payload, gw_headers)
             job_a_results.append(res)
-            print(f"Status: {res['status_code']}, Blocked: {res['blocked']}, Latency: {res['duration_ms']}ms")
+            print(f"Status: {res['status_code'] or 'ERR'}, Blocked: {res['blocked']}, Latency: {res['duration_ms']}ms")
             time.sleep(0.5)
 
-    # Step 3: Handle Job B (benign capture content to /a/capture)
+    # Job B: benign capture content
     mode_str = "smoke" if args.smoke else "volume"
     target_count = len(REPOS) if args.smoke else args.limit
     items = get_items_for_run(cache, REPOS, mode_str, target_count)
@@ -350,7 +355,7 @@ def main():
         print(f"[{i+1}/{len(items)}] Sending {item['repo']} ({item['type']}, len={content_len})... ", end="", flush=True)
         res = send_request(job_b_url, payload, gw_headers)
         job_b_results.append((item, res))
-        print(f"Status: {res['status_code']}, Blocked: {res['blocked']}, Latency: {res['duration_ms']}ms")
+        print(f"Status: {res['status_code'] or 'ERR'}, Blocked: {res['blocked']}, Latency: {res['duration_ms']}ms")
         
         # Concurrency=1 upstream: sleep to behave as a steady trickle
         time.sleep(0.8)
@@ -364,5 +369,7 @@ def main():
     print(f"Job B: {blocked_b}/{len(items)} blocked by the guard.")
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__":  # direct invocation delegates to the same main()
+    _ap = argparse.ArgumentParser(description="OSS Content Traffic Generator")
+    _add_args(_ap)
+    main(_ap.parse_args())

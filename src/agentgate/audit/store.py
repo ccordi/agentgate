@@ -7,13 +7,14 @@ This is also what keeps SQLite's serialized writes from mattering for the benchm
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import delete, select
+from sqlalchemy import Integer, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 from agentgate.audit.models import Base, ContentSample, RequestRecord
@@ -48,17 +49,17 @@ class RequestAudit:
     # Optional/trailing so existing constructions stay valid; populated by the endpoint.
     latency_inject_ms: float | None = None
     latency_redact_ms: float | None = None
-    skill_flagged: bool = False
-    skill_hard: bool = False
-    skill_reasons: list | None = None
+    tool_def_flagged: bool = False
+    tool_def_hard: bool = False
+    tool_def_reasons: list | None = None
     # True when the injection verdict crossed the hard threshold (would-block). Trailing
     # default so existing constructions stay valid; in observe-mode the row is still status 200.
     injection_hard: bool = False
     # Explicit request UUID lets content samples share the same id.
     id: uuid.UUID | None = None
     # Effective injection-guard backend for this request — the resolved backend after
-    # per-key override + deberta-availability fallback, i.e. what _scan_request actually
-    # ran. None for rows written before the scan (e.g. skill_blocked rejections).
+    # per-key override + deberta-availability fallback, i.e. what run_injection_scan
+    # actually ran. None for rows written before the scan (e.g. tool_def_blocked rejections).
     guard_backend: str | None = None
 
 
@@ -104,37 +105,13 @@ class AuditStore:
             return
         try:
             async with self._sessionmaker() as session:
-                kwargs: dict = dict(
-                    ts=audit.ts,
-                    agent_id=audit.agent_id,
-                    key_id=audit.key_id,
-                    model_requested=audit.model_requested,
-                    route_provider=audit.route_provider,
-                    route_is_local=audit.route_is_local,
-                    upstream_model=audit.upstream_model,
-                    sensitivity_class=audit.sensitivity_class,
-                    tokens_prompt=audit.tokens_prompt,
-                    tokens_completion=audit.tokens_completion,
-                    cost_usd=audit.cost_usd,
-                    latency_total_ms=audit.latency_total_ms,
-                    latency_upstream_ms=audit.latency_upstream_ms,
-                    latency_inject_ms=audit.latency_inject_ms,
-                    latency_redact_ms=audit.latency_redact_ms,
-                    injection_flagged=audit.injection_flagged,
-                    injection_hard=audit.injection_hard,
-                    injection_score=audit.injection_score,
-                    redaction_hit_count=audit.redaction_hit_count,
-                    redaction_hit_types=audit.redaction_hit_types,
-                    tool_call_count=audit.tool_call_count,
-                    finish_reason=audit.finish_reason,
-                    status=audit.status,
-                    skill_flagged=audit.skill_flagged,
-                    skill_hard=audit.skill_hard,
-                    skill_reasons=audit.skill_reasons,
-                    guard_backend=audit.guard_backend,
-                )
-                if audit.id is not None:
-                    kwargs["id"] = audit.id
+                # RequestAudit field names are the RequestRecord column names — pinned by
+                # test_request_audit_fields_match_columns so this shortcut can't drift.
+                # Shallow by field, not `asdict`: `asdict` deep-copies every value on the
+                # way to a constructor that discards the copy, ~10x the cost per request.
+                kwargs = {f.name: getattr(audit, f.name) for f in dataclasses.fields(audit)}
+                if kwargs.get("id") is None:
+                    kwargs.pop("id")
                 session.add(RequestRecord(**kwargs))
                 await session.commit()
         except Exception:  # noqa: BLE001 — auditing must never break forwarding
@@ -181,6 +158,96 @@ class AuditStore:
         async with self._sessionmaker() as session:
             result = await session.execute(select(ContentSample))
             return len(result.scalars().all())
+
+    # ---- read path -------------------------------------------------------------
+    # Unlike the write methods above, these do NOT swallow exceptions: they back the
+    # `agentgate audit` CLI and tests, where a silent empty result is worse than a
+    # traceback.
+
+    def _require_sessionmaker(self) -> async_sessionmaker:
+        if self._sessionmaker is None:
+            raise RuntimeError("audit store not initialized; call init() first")
+        return self._sessionmaker
+
+    async def fetch_requests(
+        self,
+        *,
+        limit: int = 20,
+        agent_id: str | None = None,
+        flagged_only: bool = False,
+    ) -> list[RequestRecord]:
+        """Newest-first metadata rows, optionally filtered by agent or flagged status."""
+        stmt = select(RequestRecord).order_by(RequestRecord.ts.desc()).limit(limit)
+        if agent_id is not None:
+            stmt = stmt.where(RequestRecord.agent_id == agent_id)
+        if flagged_only:
+            stmt = stmt.where(
+                RequestRecord.injection_flagged.is_(True) | RequestRecord.tool_def_flagged.is_(True)
+            )
+        async with self._require_sessionmaker()() as session:
+            return list((await session.execute(stmt)).scalars().all())
+
+    async def fetch_request(self, request_id: uuid.UUID) -> RequestRecord | None:
+        """One metadata row by exact id, or None."""
+        async with self._require_sessionmaker()() as session:
+            return await session.scalar(
+                select(RequestRecord).where(RequestRecord.id == request_id)
+            )
+
+    async def fetch_content_samples(self, request_id: uuid.UUID) -> list[ContentSample]:
+        """Content-tier rows belonging to one request, oldest first."""
+        stmt = (
+            select(ContentSample)
+            .where(ContentSample.request_id == request_id)
+            .order_by(ContentSample.ts)
+        )
+        async with self._require_sessionmaker()() as session:
+            return list((await session.execute(stmt)).scalars().all())
+
+    async def summary(self, *, since: datetime | None = None) -> dict:
+        """Aggregate counts over the metadata tier, optionally from `since` onwards."""
+        def scoped(stmt):
+            return stmt.where(RequestRecord.ts >= since) if since is not None else stmt
+
+        async with self._require_sessionmaker()() as session:
+            totals = (
+                await session.execute(scoped(select(
+                    func.count(RequestRecord.id),
+                    func.sum(func.cast(RequestRecord.injection_flagged, Integer)),
+                    func.sum(func.cast(RequestRecord.injection_hard, Integer)),
+                    func.sum(func.cast(RequestRecord.tool_def_flagged, Integer)),
+                    func.sum(RequestRecord.redaction_hit_count),
+                    func.sum(RequestRecord.cost_usd),
+                    func.sum(RequestRecord.tokens_prompt),
+                    func.sum(RequestRecord.tokens_completion),
+                )))
+            ).one()
+            by_provider = (
+                await session.execute(scoped(
+                    select(RequestRecord.route_provider, func.count(RequestRecord.id))
+                    .group_by(RequestRecord.route_provider)
+                ))
+            ).all()
+            by_status = (
+                await session.execute(scoped(
+                    select(RequestRecord.status, func.count(RequestRecord.id))
+                    .group_by(RequestRecord.status)
+                ))
+            ).all()
+
+        n, inj_flagged, inj_hard, tool_def_flagged, red_hits, cost, tok_p, tok_c = totals
+        return {
+            "requests": n,
+            "by_provider": {str(p): c for p, c in by_provider},
+            "by_status": {str(s): c for s, c in by_status},
+            "injection_flagged": inj_flagged or 0,
+            "injection_hard": inj_hard or 0,
+            "tool_def_flagged": tool_def_flagged or 0,
+            "redaction_hits": red_hits or 0,
+            "cost_usd": float(cost or 0.0),
+            "tokens_prompt": tok_p or 0,
+            "tokens_completion": tok_c or 0,
+        }
 
 
 def utcnow() -> datetime:

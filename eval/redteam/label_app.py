@@ -26,11 +26,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import streamlit as st  # noqa: E402
 
-from eval.redteam.loader import load_jsonl, write_jsonl  # noqa: E402
+from eval.redteam.loader import CORPUS_DIR, GOLD_SET_LABELED, load_jsonl, write_jsonl  # noqa: E402
 from eval.redteam.schema import CorpusItem, LabelOrigin  # noqa: E402
 
-DEFAULT_IN = "eval/redteam/corpus/gold_set_unlabeled.jsonl"
-DEFAULT_OUT = "eval/redteam/corpus/gold_set_labeled.jsonl"
+DEFAULT_IN = str(CORPUS_DIR / "gold_set_unlabeled.jsonl")
+DEFAULT_OUT = str(GOLD_SET_LABELED)
 
 CHOICES = ["Unknown", "Benign", "Malicious"]
 CHOICE_TO_LABEL = {"Unknown": None, "Benign": 0, "Malicious": 1}
@@ -39,6 +39,15 @@ LABEL_TO_CHOICE = {None: "Unknown", 0: "Benign", 1: "Malicious"}
 
 def _key(item_id: str) -> str:
     return f"choice_{item_id}"
+
+
+def _save_button(out_path: str, *, key: str | None = None, show_path: bool = False) -> None:
+    """The Save button — rendered twice (sidebar + page bottom), defined once."""
+    if st.button("💾 Save", key=key, type="primary", use_container_width=True,
+                 disabled="gold_items" not in st.session_state):
+        total, binary = save_items(out_path)
+        msg = f"Saved {total} ({binary} labeled 0/1, {total - binary} Unknown)"
+        st.success(f"{msg} → {out_path}" if show_path else msg)
 
 
 def load_items(in_path: str, out_path: str) -> None:
@@ -97,10 +106,7 @@ with st.sidebar:
         except FileNotFoundError:
             st.error(f"Not found: {in_path}")
     # Save lives in the sidebar (which stays put while you scroll the items).
-    if st.button("💾 Save", type="primary", use_container_width=True,
-                 disabled="gold_items" not in st.session_state):
-        total, binary = save_items(out_path)
-        st.success(f"Saved {total} ({binary} labeled 0/1, {total - binary} Unknown)")
+    _save_button(out_path)
     st.caption("Label from the text alone — category & scanner score are intentionally hidden.")
 
 if "gold_items" not in st.session_state:
@@ -130,6 +136,4 @@ for idx, it in enumerate(items, 1):
     st.radio("label", CHOICES, key=_key(it.id), horizontal=True, label_visibility="collapsed")
     st.divider()
 
-if st.button("💾 Save", key="save_bottom", type="primary", use_container_width=True):
-    total, binary = save_items(out_path)
-    st.success(f"Saved {total} items ({binary} labeled 0/1, {total - binary} Unknown) → {out_path}")
+_save_button(out_path, key="save_bottom", show_path=True)

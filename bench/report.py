@@ -1,8 +1,26 @@
-"""Render `docs/benchmarks.md` from the bench phases + per-stage DB stats."""
+"""Render `docs/benchmarks.md` from the bench phases + per-stage DB stats.
+
+`bench.run` overwrites the artifact wholesale, and the artifact's own header tells you to
+run it — so anything hand-authored in that file is one regeneration away from being gone.
+Hand-authored regions therefore live as committed fragments under `bench/sections/` and
+are stitched in by `_section()`, the same mechanism `eval/redteam/report.py` uses. If you
+want to add prose to the benchmark, add a fragment; do not edit `docs/benchmarks.md`.
+"""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
+
+_SECTIONS = Path(__file__).resolve().parent / "sections"
+
+
+def _section(name: str) -> str | None:
+    """An authored fragment, or None if it isn't committed."""
+    frag = _SECTIONS / f"{name}.md"
+    if not frag.exists():
+        return None
+    return "\n" + frag.read_text(encoding="utf-8").rstrip("\n") + "\n"
 
 
 def _ms(x) -> str:
@@ -44,6 +62,35 @@ audit DB (`gateway internal` = total − upstream). It is small enough that the 
 variance — it swings widely between runs and can even come out negative — so the server-side
 per-stage table is the authoritative overhead figure.
 """
+
+
+def _guard_label(backends: dict[str, int] | None) -> str:
+    """Name the guard backend the bench actually ran, counted off the audit rows.
+
+    The figure is not backend-invariant. The inject-scan row is sub-millisecond when these
+    runs resolve to the regex heuristic; the ONNX classifier is much slower per item. Read
+    the backend from the measured audit rows rather than inferring it from the launch
+    command.
+    """
+    if not backends:
+        return ("\n> **Guard backend: unrecorded.** No backend was read off the measured "
+                "requests, so the inject-scan figures below cannot be attributed to one. "
+                "The overhead figure is not backend-invariant — treat the scan stage as "
+                "unlabeled.\n")
+    ranked = sorted(backends.items(), key=lambda kv: -kv[1])
+    total = sum(backends.values())
+    shown = ", ".join(f"`{name}` ({n}/{total})" for name, n in ranked)
+    note = f"\n> **Guard backend actually measured: {shown}**, read from the `guard_backend` "
+    note += "column of the audit rows this run produced. "
+    if ranked[0][0] == "heuristic":
+        note += ("The inbound scan measured here is the **regex baseline**, not the DeBERTa "
+                 "classifier — which is why the `inject scan` row below is sub-millisecond. "
+                 "This overhead figure is **not** backend-invariant; a model-backed guard "
+                 "costs orders of magnitude more per scanned item.\n")
+    else:
+        note += ("The overhead figure is specific to that backend and is **not** "
+                 "backend-invariant.\n")
+    return note
 
 
 def render(phases: list[dict], per_stage: dict) -> str:
@@ -90,8 +137,8 @@ def render(phases: list[dict], per_stage: dict) -> str:
         parts.append(f"The gateway's own added latency — measured server-side and isolated from "
                      f"the upstream — is **{_ms(gi['p95'])} ms p95 ({_ms(gi['p99'])} ms p99)** "
                      f"across {gi['count']} requests (parse + inject-scan + spend check + SSE tee "
-                     "+ fire-and-forget audit dispatch). This is the floor the proxy adds "
-                     "regardless of which guard backend is enabled.\n")
+                     "+ fire-and-forget audit dispatch).\n")
+        parts.append(_guard_label(per_stage.get("guard_backends")))
         if (gw and base and gw["result"]["dur_p99"] is not None
                 and base["result"]["dur_p99"] is not None):
             oh = gw["result"]["dur_p99"] - base["result"]["dur_p99"]
@@ -126,12 +173,20 @@ def render(phases: list[dict], per_stage: dict) -> str:
             sr.append([label, s["count"], _ms(s["p50"]), _ms(s["p95"]), _ms(s["p99"]), _ms(s["max"])])
     parts.append(_table(["stage", "n", "p50", "p95", "p99", "max"], sr))
 
+    # Hand-authored: how this single run sits in a replicate set, which one run can't know.
+    spread = _section("replicate_spread")
+    if spread:
+        parts.append(spread)
+
     # Deferred.
     parts.append("\n## Deferred\n")
-    parts.append("- **Routing overhead** — the sensitivity classifier + rules-table router "
-                 "are not yet implemented; this harness leaves a slot for a router-on/off "
-                 "comparison (and a `latency_classify_ms` / `latency_route_ms` per-stage row) "
-                 "once they exist.\n")
+    # The classifier and router run on every request, but the benchmark does not yet
+    # decompose their cost.
+    parts.append("- **Routing overhead** — the sensitivity classifier and rules-table router "
+                 "ship and run on every request, but this harness does not yet **benchmark** "
+                 "them separately: it leaves a slot for a router-on/off comparison and a "
+                 "`latency_classify_ms` per-stage row (the column exists in the audit schema "
+                 "and is never populated).\n")
     parts.append("- **Real local-model upstream** — the mock is the reproducible baseline; a "
                  "real omlx/llama.cpp run is an optional later comparison once a model is pulled.\n")
     parts.append("\n> Caveats: single machine, one uvicorn worker, loopback (no real network "

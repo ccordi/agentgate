@@ -22,11 +22,22 @@ jobs:
       - name: Set up Python
         run: uv python install
 
+      # `tracing` and `egress-mcp` are pure-Python and cheap, and without them their
+      # tests silently skip — including the pin that message content never reaches a
+      # span attribute. `guard` is deliberately omitted: it needs a pulled ONNX model,
+      # so its two smoke tests stay environment-gated.
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --extra tracing --extra egress-mcp
 
       - name: Lint (ruff)
         run: uv run ruff check .
 
       - name: Run tests
         run: uv run pytest -q
+
+      # Keep the basic eval workflow usable from a fresh clone without keys or models.
+      - name: Eval harness smoke (offline, no keys)
+        run: uv run python -m eval.redteam score
+
+      - name: Report renders
+        run: uv run python -m eval.redteam report --out /tmp/redteam-results.md

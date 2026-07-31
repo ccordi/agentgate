@@ -7,6 +7,7 @@ entropy only, runs inline on the hot path.
 Public surface:
   detect(text)  → [(hit_type, count)]          # shared primitive
   redact(text)  → RedactionResult              # rewrites spans in-place
+  explain(text) → [(hit_type, matched_span)]   # off-hot-path: which substring fired
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from dataclasses import dataclass, field
 # ---------------------------------------------------------------------------
 
 # High-confidence secret shapes (prefix-anchored → very low false-positive rate).
-_SECRET_PATTERNS: list[tuple[re.Pattern, str]] = [
+SECRET_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----"), "private_key"),
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "aws_access_key"),
     (re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"), "openai_key"),
@@ -33,14 +34,18 @@ _SECRET_PATTERNS: list[tuple[re.Pattern, str]] = [
     ),
 ]
 
-_PII_PATTERNS: list[tuple[re.Pattern, str]] = [
+PII_PATTERNS: list[tuple[re.Pattern, str]] = [
     # Require an alphabetic TLD (>=2) so version pins / IPs like `cache@v5.0.5` or
-    # `svc@10.0.0.1` aren't read as emails (2b over-fire fix; real `.com`/`.invalid` keep matching).
-    (re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}\b"), "email"),
+    # `svc@10.0.0.1` aren't read as emails; real `.com`/`.invalid` addresses still match.
+    # Every quantifier is bounded. `.` is inside the local-part class, so an unbounded `+`
+    # hands the engine a fresh start position every other character of a dot-rich run —
+    # quadratic, on the event loop, on attacker-chosen input. The bounds sit above anything
+    # real (RFC 5321 caps a local part at 64, DNS labels at 63), so matches are unchanged.
+    (re.compile(r"\b[\w.+-]{1,128}@[\w-]{1,63}(?:\.[\w-]{1,63}){0,12}\.[A-Za-z]{2,63}\b"), "email"),
     (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "ssn"),
     (re.compile(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"), "phone"),
     # Reject a 13-16 digit run that is embedded in a longer numeric/decimal literal
-    # (e.g. the fractional part of a float score `0.5842405849569906`); 2b over-fire fix.
+    # (e.g. the fractional part of a float score `0.5842405849569906`).
     (re.compile(r"(?<![\d.])\b(?:\d[ -]?){13,16}\b(?![\d.])"), "card_number"),
 ]
 
@@ -106,7 +111,7 @@ def detect(text: str) -> list[tuple[str, int]]:
     """
     hits: dict[str, int] = {}
 
-    for pat, name in _SECRET_PATTERNS:
+    for pat, name in SECRET_PATTERNS:
         matches = pat.findall(text)
         if matches:
             hits[name] = hits.get(name, 0) + len(matches)
@@ -118,12 +123,45 @@ def detect(text: str) -> list[tuple[str, int]]:
     ):
         hits["high_entropy_token"] = hits.get("high_entropy_token", 0) + 1
 
-    for pat, name in _PII_PATTERNS:
+    for pat, name in PII_PATTERNS:
         matches = pat.findall(text)
         if matches:
             hits[name] = hits.get(name, 0) + len(matches)
 
     return list(hits.items())
+
+
+def explain(text: str) -> list[tuple[str, str]]:
+    """Return [(hit_type, matched_substring)] — *why* ``detect`` fired, in order.
+
+    A debugging affordance, not a hot-path call: it walks the patterns a second time and
+    keeps every match rather than counting. Used by the over-fire report
+    (``eval/redteam/classifier_eval.py``) to root-cause a firing back to the exact
+    offending span, and useful by hand when a redaction looks wrong.
+    """
+    out: list[tuple[str, str]] = []
+
+    for pat, name in SECRET_PATTERNS:
+        out.extend((name, m.group(0)) for m in pat.finditer(text))
+
+    # Mirror both branches of detect()'s high-entropy check so the offender is never
+    # blank: a generic alnum/_/- run over the entropy floor, and a base64 blob carrying
+    # `+`/`/` that `_is_b64_secret` accepts.
+    out.extend(
+        ("high_entropy_token", tok)
+        for tok in _TOKEN_RE.findall(text)
+        if _shannon_bits(tok) >= _ENTROPY_BITS
+    )
+    out.extend(
+        ("high_entropy_token", tok)
+        for tok in _B64_BLOB_RE.findall(text)
+        if _is_b64_secret(tok)
+    )
+
+    for pat, name in PII_PATTERNS:
+        out.extend((name, m.group(0)) for m in pat.finditer(text))
+
+    return out
 
 
 def redact(text: str) -> RedactionResult:
@@ -147,11 +185,11 @@ def redact(text: str) -> RedactionResult:
     out = text
 
     # Secrets first
-    for pat, name in _SECRET_PATTERNS:
+    for pat, name in SECRET_PATTERNS:
         out = pat.sub(_make_sub(name), out)
 
     # PII second (some spans may already be gone)
-    for pat, name in _PII_PATTERNS:
+    for pat, name in PII_PATTERNS:
         out = pat.sub(_make_sub(name), out)
 
     # High-entropy tokens (replace each matching token)

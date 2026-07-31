@@ -1,7 +1,7 @@
 [project]
 name = "agentgate"
 version = "0.0.1"
-description = "Transparent reverse-proxy safety gateway for LLM agents (OpenAI- and Anthropic-compatible)"
+description = "Transparent reverse-proxy safety gateway for LLM agents (OpenAI Chat Completions)"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -15,11 +15,10 @@ dependencies = [
     "redis>=5.2",
     "pyyaml>=6.0",
     "cryptography>=43",
-    # observability
+    # observability. Prometheus stays core — /metrics is a live, consumed surface.
+    # OpenTelemetry lives in the `tracing` extra: tracing is opt-in, and always-installed
+    # packages would be instrumenting every request for a path that is off by default.
     "prometheus-client>=0.21",
-    "opentelemetry-api>=1.29",
-    "opentelemetry-sdk>=1.29",
-    "opentelemetry-instrumentation-fastapi>=0.50b0",
 ]
 
 [project.optional-dependencies]
@@ -34,11 +33,21 @@ guard = [
     "tokenizers>=0.21",
     "numpy>=2.0",
 ]
-# Tier-3 egress PEP — stdio MCP server wrapping `pep.safe_http_request`.
-# The harness launches this as the only network-capable tool; every
-# call consults the PDP before any egress. FastMCP only; the PEP core has no new deps.
+# Egress PEP — stdio MCP server wrapping `egress.pep.safe_http_request`.
+# The configured network tool consults the PDP before each request. FastMCP only;
+# the PEP core has no new dependencies.
 egress-mcp = [
     "mcp>=1.2",
+]
+# OpenTelemetry tracing, off by default — see observability/otel.py: with the extra
+# installed each request emits one metadata-only GenAI span (never message content); the
+# audit DB's latency_*_ms columns stay the record behind the latency decomposition. The OTLP
+# exporter is included so AGENTGATE_OTLP_ENDPOINT works whenever the extra is installed.
+tracing = [
+    "opentelemetry-api>=1.29",
+    "opentelemetry-sdk>=1.29",
+    "opentelemetry-instrumentation-fastapi>=0.50b0",
+    "opentelemetry-exporter-otlp-proto-http>=1.29",
 ]
 
 [project.scripts]
@@ -54,6 +63,9 @@ packages = ["src/agentgate"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = ["live: needs a running gateway/model server"]
+# Live tests are opt-in: `uv run pytest -m live` (a bare -m on the command line wins).
+addopts = "-m 'not live'"
 
 [tool.ruff]
 line-length = 100
@@ -64,17 +76,15 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.ruff.lint.per-file-ignores]
 # Injection / secret-pattern signal tables: regexes are most legible on one line each.
-"src/agentgate/security/injection.py" = ["E501"]
-"src/agentgate/security/classifier.py" = ["E501"]
-"src/agentgate/security/redaction.py" = ["E501"]
-"src/agentgate/security/skill_inspector.py" = ["E501"]
+"src/agentgate/guards/heuristic.py" = ["E501"]
+"src/agentgate/sensitivity.py" = ["E501"]
+"src/agentgate/redaction.py" = ["E501"]
+"src/agentgate/tool_inspector.py" = ["E501"]
 # Tests carry inline SSE/JSON fixtures that don't wrap cleanly.
 "tests/*" = ["E501"]
 # Bench scripts: phase dicts + report f-strings read better unwrapped.
 "bench/*" = ["E501"]
 "eval/redteam/*" = ["E501"]
-# Audit CLI: argparse help strings + SQL read better unwrapped.
-"scripts/audit.py" = ["E501"]
 
 
 # Dev tooling. uv installs the `dev` group by default (PEP 735), so `uv run pytest`
@@ -84,4 +94,15 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
     "ruff>=0.9",
+    "mypy>=1.14",
 ]
+
+[tool.mypy]
+python_version = "3.13"
+# Mypy checks the gateway package by default. Check the supporting code with
+# `uv run mypy eval bench scripts tests`.
+files = ["src/agentgate"]
+# Third-party deps without stubs (mcp, onnxruntime, streamlit, …). Our own modules
+# are on the path, so import breaks in this tree still surface.
+ignore_missing_imports = true
+check_untyped_defs = true

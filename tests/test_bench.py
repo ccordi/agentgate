@@ -6,22 +6,9 @@ can silently corrupt the artifact's numbers.
 
 from __future__ import annotations
 
-from agentgate.config import Settings
-from agentgate.routing import providers as routing_providers
-from agentgate.routing import router as routing_router
+from agentgate.pipeline import select_provider
 from bench import stats
-
-
-def _resolve_like_app(settings: Settings, *, sensitivity: str = "none", agent_id=None):
-    """Replicate app.py's provider-selection branch so the test exercises the SAME path
-    the live gateway takes (router when enabled, else settings.provider())."""
-    if settings.routing.enabled:
-        decision = routing_router.decide(
-            routing_router.RouteContext(sensitivity=sensitivity, agent_id=agent_id),
-            settings.routing,
-        )
-        return routing_providers.resolve(settings, decision)
-    return settings.provider()
+from tests.support import make_settings
 
 
 def test_percentile_linear_interpolation():
@@ -49,14 +36,14 @@ def test_gateway_overhead_clamps_negative():
 
 
 def test_mock_provider_is_bench_only_and_cloud_typed():
-    s = Settings()
+    s = make_settings()
     mock = s.provider("mock")
     assert mock.base_url == "http://127.0.0.1:4200"
     # is_local=False so only the USD cap applies under load (never the local req-count guard).
     assert mock.is_local is False
     # Selected only via env; not the default.
     assert s.default_provider != "mock"
-    assert Settings(default_provider="mock").provider().name == "mock"
+    assert make_settings(default_provider="mock").provider().name == "mock"
 
 
 def test_bench_gateway_config_actually_routes_benign_traffic_to_mock():
@@ -70,12 +57,12 @@ def test_bench_gateway_config_actually_routes_benign_traffic_to_mock():
     fail% 100%. The bench must disable routing so default_provider=mock wins.
     """
     # The original (buggy) bench config: default_provider=mock, routing left at default.
-    buggy = Settings(default_provider="mock")
+    buggy = make_settings(default_provider="mock")
     assert buggy.routing.enabled is True
-    assert _resolve_like_app(buggy).name == "gemini"  # NOT the mock — this is the bug.
+    assert select_provider(buggy, "none", None).name == "gemini"  # NOT the mock — this is the bug.
 
     # The fixed bench config: routing disabled (as bench/run.py now sets via
     # AGENTGATE_ROUTING__ENABLED=false) → benign traffic resolves to the mock.
-    fixed = Settings(default_provider="mock", routing={"enabled": False})
-    assert _resolve_like_app(fixed).name == "mock"
-    assert _resolve_like_app(fixed).base_url == "http://127.0.0.1:4200"
+    fixed = make_settings(default_provider="mock", routing={"enabled": False})
+    assert select_provider(fixed, "none", None).name == "mock"
+    assert select_provider(fixed, "none", None).base_url == "http://127.0.0.1:4200"

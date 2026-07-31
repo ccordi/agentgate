@@ -1,11 +1,11 @@
 """Inter-rater agreement — Cohen's κ, hand-rolled (no sklearn).
 
-This is the credibility number for the whole chain: it quantifies how well the independent
-judge agrees with the human gold set. Reporting κ (not just raw agreement) accounts for
+This quantifies how well the independent judge agrees with the human gold set. Reporting κ
+(not just raw agreement) accounts for
 agreement that would happen by chance, which matters when one class dominates.
 
 Used two ways:
-  * judge vs **human gold set** → validates the judge (the headline).
+  * judge vs **human gold set** → validates the judge.
   * judge vs **known-source labels** → a sanity check on authored/public items.
 """
 

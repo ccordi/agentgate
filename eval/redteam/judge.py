@@ -17,51 +17,40 @@ import asyncio
 
 import httpx
 
-from agentgate.security.llm_guard import (
-    _CACHE_PATH as _CACHE_PATH,
-)
-from agentgate.security.llm_guard import (
-    _SYSTEM as _SYSTEM,
-)
-from agentgate.security.llm_guard import (
-    JudgeConfig as JudgeConfig,
-)
-from agentgate.security.llm_guard import (
-    JudgeLabel as JudgeLabel,
-)
-from agentgate.security.llm_guard import (
-    LLMGuard as LLMGuard,
-)
-from agentgate.security.llm_guard import (
-    _Cache as _Cache,
-)
-from agentgate.security.llm_guard import (
-    _parse_label as _parse_label,
-)
-from agentgate.security.llm_guard import (
-    scan_text as scan_text,
+from agentgate.guards.local_llm import (
+    JUDGE_SYSTEM_PROMPT,
+    JudgeCache,
+    JudgeConfig,
+    JudgeLabel,
+    LLMGuard,
+    parse_judge_label,
 )
 
+# LLMGuard is re-exported, not used here: `__main__`'s llm-guard detector and the
+# eval-side guard tests reach it through this module.
+__all__ = ["CACHE_PATH", "JudgeConfig", "JudgeLabel", "LLMGuard", "cached_labels",
+           "judge_corpus", "run_judge"]
+
+from .common import chat_completion
+from .loader import RUNS_DIR
 from .schema import CorpusItem
+
+# The eval cache is separate from the guard's runtime cache, so live traffic and
+# measurement runs do not share an artifact.
+CACHE_PATH = RUNS_DIR / "judge_cache.json"
 
 
 async def _judge_one(client: httpx.AsyncClient, cfg: JudgeConfig, item: CorpusItem) -> JudgeLabel:
-    resp = await client.post(
-        f"{cfg.base_url}/chat/completions",
-        headers={"Authorization": f"Bearer {cfg.api_key}"},
-        json={
-            "model": cfg.model,
-            "temperature": 0,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": _SYSTEM},
-                {"role": "user", "content": item.text},
-            ],
-        },
+    content = await chat_completion(
+        client, cfg.base_url, cfg.api_key, cfg.model,
+        [
+            {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+            {"role": "user", "content": item.text},
+        ],
+        temperature=0,
+        response_format={"type": "json_object"},
     )
-    resp.raise_for_status()
-    content = resp.json()["choices"][0]["message"]["content"]
-    return _parse_label(content, cfg.model)
+    return parse_judge_label(content, cfg.model)
 
 
 async def judge_corpus(
@@ -82,11 +71,11 @@ async def judge_corpus(
             "AGENTGATE_JUDGE_MODEL / AGENTGATE_JUDGE_BASE_URL)."
         )
 
-    cache = _Cache.load() if use_cache else _Cache()
+    cache = JudgeCache.load(CACHE_PATH) if use_cache else JudgeCache(data={}, path=CACHE_PATH)
     results: dict[str, JudgeLabel] = {}
     todo: list[CorpusItem] = []
     for it in items:
-        hit = cache.data.get(_Cache.key(cfg.model, it.id))
+        hit = cache.data.get(JudgeCache.key(cfg.model, it.id))
         if use_cache and hit is not None:
             results[it.id] = JudgeLabel(**hit)
         else:
@@ -105,7 +94,7 @@ async def judge_corpus(
             for coro in asyncio.as_completed([worker(it) for it in todo]):
                 item_id, label = await coro
                 results[item_id] = label
-                cache.data[_Cache.key(cfg.model, item_id)] = label.as_dict()
+                cache.data[JudgeCache.key(cfg.model, item_id)] = label.as_dict()
         finally:
             if owns_client:
                 await client.aclose()
@@ -125,10 +114,16 @@ def cached_labels(model: str) -> dict[str, JudgeLabel]:
 
     Used by the report step so rendering never hits the network.
     """
-    cache = _Cache.load()
+    cache = JudgeCache.load(CACHE_PATH)
     prefix = f"{model}:"
     out: dict[str, JudgeLabel] = {}
     for key, val in cache.data.items():
-        if key.startswith(prefix):
-            out[key[len(prefix):]] = JudgeLabel(**val)
+        if not key.startswith(prefix):
+            continue
+        item_id = key[len(prefix):]
+        # Guard-written keys are `{model}:guard-<tag>:{id}` — same prefix, different shape.
+        # Skip them so a shared cache file can't produce garbage ids here.
+        if item_id.startswith("guard-"):
+            continue
+        out[item_id] = JudgeLabel(**val)
     return out

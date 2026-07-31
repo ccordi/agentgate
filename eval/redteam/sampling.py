@@ -1,23 +1,22 @@
 """Stratified sampling for the human gold set.
 
-The gold set validates the judge, so the sample must NOT just be what the scanner flagged —
-that would bake in the false-negative trap (you'd never gold-label the attacks that slipped
-through). We stratify across **scanner prediction** (flagged vs. not) and **source**, then
-draw deterministically, so the human labels a representative slice of *all* content.
+The gold set validates the judge, so it must include content the scanner did not flag.
+Sampling is stratified by scanner prediction and source, then drawn deterministically.
 """
 
 from __future__ import annotations
 
 import random
 
-from agentgate.security import injection
+from agentgate import guards
+from agentgate.guards import heuristic
 
 from .schema import CorpusItem, LabelOrigin
 
 
 def _stratum(item: CorpusItem) -> tuple[str, bool]:
     """Bucket key: (source, predicted-positive-by-scanner-at-flag-threshold)."""
-    flagged = injection.scan_text(item.text).score >= injection.FLAG_THRESHOLD
+    flagged = heuristic.scan_text(item.text).score >= guards.FLAG_THRESHOLD
     return (item.source, flagged)
 
 
@@ -57,13 +56,10 @@ def stratified_sample(
 
 
 def to_gold_template(item: CorpusItem) -> CorpusItem:
-    """A **blind** gold-set line for a human to fill from the TEXT ALONE.
+    """A blind gold-set line for a human to label from its text.
 
-    Deliberately omits ``category`` and the scanner score — surfacing either would leak the
-    expected label and turn an independent human judgment into a rubber-stamp of the
-    corpus's existing label (re-introducing the circularity the gold set exists to avoid).
-    Only ``id`` (to re-join the category/source later) and ``text`` are shown; the human
-    sets ``label`` to 0 or 1.
+    Category and scanner score are omitted to avoid revealing the expected label.
+    ``id`` is retained so category and source can be joined after labeling.
     """
     return CorpusItem(
         id=item.id,

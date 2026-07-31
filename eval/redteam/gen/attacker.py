@@ -25,6 +25,7 @@ import re
 import httpx
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from ..common import chat_completion
 from .seeds import Seed
 
 # Refusal / watered-down markers — a cheap validity guard that works even without a judge.
@@ -107,21 +108,16 @@ def looks_like_refusal(text: str) -> bool:
 
 async def _one(client: httpx.AsyncClient, cfg: AttackerConfig, seed: Seed, idx: int) -> str:
     hint = _VARIANT_HINTS[idx % len(_VARIANT_HINTS)]
-    resp = await client.post(
-        f"{cfg.base_url}/chat/completions",
-        headers={"Authorization": f"Bearer {cfg.api_key}"},
-        json={
-            "model": cfg.model,
-            "temperature": cfg.temperature,
-            "max_tokens": cfg.max_tokens,
-            "messages": [
-                {"role": "system", "content": _SYSTEM},
-                {"role": "user", "content": _user_prompt(seed, hint)},
-            ],
-        },
+    content = await chat_completion(
+        client, cfg.base_url, cfg.api_key, cfg.model,
+        [
+            {"role": "system", "content": _SYSTEM},
+            {"role": "user", "content": _user_prompt(seed, hint)},
+        ],
+        temperature=cfg.temperature,
+        max_tokens=cfg.max_tokens,
     )
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"].strip()
+    return content.strip()
 
 
 async def generate(

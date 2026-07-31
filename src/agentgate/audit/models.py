@@ -72,13 +72,14 @@ class RequestRecord(Base):
     finish_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     status: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
-    skill_flagged: Mapped[bool] = mapped_column(Boolean, default=False)
-    skill_hard: Mapped[bool] = mapped_column(Boolean, default=False)
-    skill_reasons: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # Tool-definition screening verdicts.
+    tool_def_flagged: Mapped[bool] = mapped_column(Boolean, default=False)
+    tool_def_hard: Mapped[bool] = mapped_column(Boolean, default=False)
+    tool_def_reasons: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
     # Effective injection-guard backend that ran for this request — "deberta" | "llm" |
     # "combined" | "heuristic", or null for rows written before the scan ran
-    # (e.g. skill_blocked rejections).
+    # (e.g. tool_def_blocked rejections).
     guard_backend: Mapped[str | None] = mapped_column(String, nullable=True)
 
 

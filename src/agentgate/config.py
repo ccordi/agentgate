@@ -7,9 +7,10 @@ from functools import lru_cache
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Recognized injection-guard backend names — shared by `guard_backend` and
-# `guard_backend_overrides` validation (config.py) and dispatch (app._scan_request).
-GUARD_BACKENDS = frozenset({"deberta", "llm", "combined", "heuristic"})
+from agentgate.guards import BACKENDS as GUARD_BACKENDS  # noqa: F401 — re-exported name
+
+# `GUARD_BACKENDS` is `guards.BACKENDS`, re-exported under the name the validators below
+# read better with. One definition, in the package that dispatches on it.
 
 
 class Provider(BaseModel):
@@ -97,7 +98,7 @@ class RoutingConfig(BaseModel):
     default_cloud: str = "gemini"  # provider name
     # When True, drop "secret" from the sensitive-stays-local rule's sensitivity_in,
     # so secret-bearing content takes the cloud fork and the outbound redaction gate
-    # (app.py, cloud-only) gets exercised. Default False — secrets stay local.
+    # (pipeline.prepare_body, cloud-only) gets exercised. Default False — secrets stay local.
     secrets_to_cloud: bool = False
     # Safety-first order: sensitive always local; if cloud is down/over-cap, local; else
     # honor agent pins; else default cloud.
@@ -185,7 +186,10 @@ class Settings(BaseSettings):
     # intentionally-non-sensitive agent.
     capture_enabled: bool = False
     capture_agent_id: str = "capture"
-    capture_path: str = "eval/redteam/corpus/fp_capture.jsonl"
+    # Private-repo markers for the sensitivity classifier (empty → never fires).
+    private_repo_markers: list[str] = Field(default_factory=list)
+    # src defaults must not point into the eval tree — see capture.py.
+    capture_path: str = "data/fp_capture.jsonl"
 
     providers: dict[str, Provider] = Field(default_factory=lambda: dict(DEFAULT_PROVIDERS))
 
@@ -194,6 +198,25 @@ class Settings(BaseSettings):
     # AGENTGATE_PROVIDERS__LOCAL__API_KEY would replace the entire entry. Instead,
     # set AGENTGATE_LOCAL_API_KEY and the validator below merges it in.
     local_api_key: str | None = None
+
+    # Bearer token for the admin plane (`/admin/kill/*`). REQUIRED to serve — startup
+    # refuses without it (validate_runtime_settings below). The kill switch is the one
+    # control aimed *at* the agent, and the agent reaches loopback by policy; an unarmed
+    # deployment read as closed while open, so "unset → open" stopped being a default and
+    # became a refused start.
+    #
+    # Must be its own value: there is deliberately no fallback to local_api_key, because the
+    # PEP holds that one to bearer the PDP, so accepting it here would authenticate the
+    # governed agent with a credential it already has.
+    admin_token: str | None = None
+
+    # Bearer token for the egress PDP (`/a/egress/decision`). REQUIRED to serve, and
+    # dedicated — distinct from admin_token (roles separated) and from local_api_key
+    # (an upstream credential, not a gateway one). A loopback bind does not make this
+    # redundant: loopback excludes remote *sockets*, not remote *code* — a web page in
+    # the operator's browser reaches 127.0.0.1, and with DNS rebinding reads responses.
+    # The token is what a page can never have.
+    pdp_token: str | None = None
 
     # --- Local-route request overrides ---
     # Env-driven knobs to tune the local upstream WITHOUT a code change, so a scoped debug
@@ -248,14 +271,87 @@ class Settings(BaseSettings):
                 update={"api_key": self.local_api_key}
             )
         return self
-    # Configured private-repo markers for the sensitivity classifier (empty → never fires).
-    private_repo_markers: list[str] = Field(default_factory=list)
 
     def provider(self, name: str | None = None) -> Provider:
         key = name or self.default_provider
         if key not in self.providers:
             raise KeyError(f"unknown provider: {key!r}")
         return self.providers[key]
+
+
+def validate_runtime_settings(settings: Settings) -> None:
+    """Refuse to serve with an unsafe posture. Called from app startup (lifespan) and
+    the CLI entry point; NOT from Settings construction, so tests and offline tooling
+    (the audit CLI) can build a Settings without a serving posture.
+
+    Two preconditions, both load-bearing rather than stylistic:
+
+    1. **The bind must be loopback, with no override flag.** The threat model's scope
+       ("one operator, one host, the gateway on loopback") is what justifies the proxy
+       routes having no inbound auth — the proxy's authentication IS the network layer.
+       `AGENTGATE_HOST=0.0.0.0` can otherwise expose the proxy silently, especially in a
+       container. There is no
+       `AGENTGATE_ALLOW_NON_LOOPBACK` escape hatch: no config state makes a non-loopback
+       bind safe, because the proxy has no credential to arm — a flag would present an
+       unsupportable topology as a supported mode. If remote callers ever become a real
+       requirement, the unlock is gateway-issued inbound credentials (which also makes
+       key_id a verified identity), not a flag.
+
+    2. **Both gateway tokens must be set.** Conditional (set-it-and-it-arms) auth left
+       every unarmed deployment looking closed while open; and loopback alone does not
+       substitute — browser-borne code reaches loopback (blind CSRF today, readable with
+       DNS rebinding), so the state-changing admin plane and the policy-oracle PDP need
+       a secret a web page cannot hold, on every interface.
+
+    Residual, stated rather than hidden: this validates `settings.host`, so a direct
+    `uvicorn agentgate.app:app --host 0.0.0.0` — which never consults settings — still
+    binds wide. The sanctioned entry points cover the env-var route; the residual is
+    documented in the threat model.
+    """
+    # Deferred to keep `config` import-light — egress.policy pulls in sensitivity,
+    # redaction and content. Not a cycle: egress.policy never imports config.
+    from agentgate.egress.policy import is_loopback_host
+
+    problems: list[str] = []
+    if not is_loopback_host(settings.host):
+        problems.append(
+            f"AGENTGATE_HOST={settings.host!r} is not a loopback address. The proxy "
+            "routes are unauthenticated by design (transparent pass-through), so a "
+            "non-loopback bind exposes them to anything routable. There is no override; "
+            "remote callers need gateway-issued inbound auth, which does not exist yet."
+        )
+    if not settings.admin_token:
+        problems.append(
+            "AGENTGATE_ADMIN_TOKEN is not set. The admin plane (/admin/kill/*) is "
+            "state-changing and must never run open: loopback does not exclude "
+            "browser-borne requests, and an unarmed deployment reads as closed."
+        )
+    if not settings.pdp_token:
+        problems.append(
+            "AGENTGATE_PDP_TOKEN is not set. The egress PDP (/a/egress/decision) is a "
+            "policy oracle; it requires its own dedicated bearer (not local_api_key, "
+            "which is the local upstream's credential)."
+        )
+    # The PEP loads the PDP token into the agent's environment. Reusing that value for the
+    # admin plane would also give the governed agent control of the kill switch.
+    pairs = (
+        ("AGENTGATE_ADMIN_TOKEN", settings.admin_token, "AGENTGATE_PDP_TOKEN", settings.pdp_token),
+        ("AGENTGATE_ADMIN_TOKEN", settings.admin_token,
+         "AGENTGATE_LOCAL_API_KEY", settings.local_api_key),
+        ("AGENTGATE_PDP_TOKEN", settings.pdp_token,
+         "AGENTGATE_LOCAL_API_KEY", settings.local_api_key),
+    )
+    for a_name, a_val, b_name, b_val in pairs:
+        if a_val and b_val and a_val == b_val:
+            problems.append(
+                f"{a_name} and {b_name} are the same value. They are separate "
+                "credentials on purpose; sharing one collapses the trust boundary "
+                "between them."
+            )
+    if problems:
+        raise RuntimeError(
+            "refusing to start with an unsafe posture:\n- " + "\n- ".join(problems)
+        )
 
 
 @lru_cache

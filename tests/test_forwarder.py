@@ -15,16 +15,20 @@ from fastapi import FastAPI, Response
 
 from agentgate.app import app as gateway_app
 from agentgate.config import Provider
-from agentgate.proxy.forwarder import forward_stream
+from agentgate.proxy.forwarder import build_upstream_url, forward_stream, prepare_headers
 from agentgate.proxy.streaming import StreamTap
 from bench.mock_upstream import app as mock_app
 from bench.mock_upstream import canned_sse
 
 
 @pytest.fixture
-def mock_client() -> httpx.AsyncClient:
+async def mock_client() -> httpx.AsyncClient:
     transport = httpx.ASGITransport(app=mock_app)
-    return httpx.AsyncClient(transport=transport, base_url="http://mock")
+    client = httpx.AsyncClient(transport=transport, base_url="http://mock")
+    try:
+        yield client
+    finally:
+        await client.aclose()
 
 
 async def test_forward_streams_and_taps_usage(mock_client: httpx.AsyncClient):
@@ -66,8 +70,6 @@ async def test_gemini_path_rewrite():
         base_url="https://generativelanguage.googleapis.com",
         chat_completions_path="/v1beta/openai/chat/completions",
     )
-    from agentgate.proxy.forwarder import build_upstream_url
-
     assert (
         build_upstream_url(provider)
         == "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
@@ -75,9 +77,6 @@ async def test_gemini_path_rewrite():
 
 
 def test_auth_header_passthrough():
-    from agentgate.config import Provider
-    from agentgate.proxy.forwarder import prepare_headers
-
     cloud = Provider(name="gemini", base_url="https://example.com")
     out = prepare_headers(
         {"Authorization": "Bearer secret", "host": "gw", "content-length": "10", "x-goog-api-key": "AIzaX"},
@@ -90,9 +89,6 @@ def test_auth_header_passthrough():
 
 
 def test_auth_header_local_override():
-    from agentgate.config import Provider
-    from agentgate.proxy.forwarder import prepare_headers
-
     local = Provider(name="local", base_url="http://127.0.0.1:8000", is_local=True, api_key="local")
     out = prepare_headers(
         {"x-goog-api-key": "AIzaX", "content-type": "application/json"},
@@ -100,6 +96,49 @@ def test_auth_header_local_override():
     )
     assert out["authorization"] == "Bearer local"
     assert "x-goog-api-key" not in out
+
+
+def test_hop_by_hop_headers_are_not_forwarded():
+    """RFC 7230 §6.1 headers describe the inbound connection, not the upstream one.
+
+    `transfer-encoding` beside the `content-length` httpx computes is the CL+TE
+    desync pair, and one AsyncClient is shared process-wide, so a poisoned pooled
+    connection would reach other callers. `proxy-authorization` is the client's own
+    proxy credential and must not reach a model provider.
+    """
+    cloud = Provider(name="gemini", base_url="https://example.invalid", is_local=False)
+    out = prepare_headers(
+        {
+            "content-type": "application/json",
+            "transfer-encoding": "chunked",
+            "te": "trailers",
+            "trailer": "X-Foo",
+            "upgrade": "websocket",
+            "keep-alive": "timeout=5",
+            "proxy-authorization": "Basic abc",
+            "proxy-authenticate": "Basic",
+            "connection": "keep-alive",
+            "host": "127.0.0.1:4100",
+            "content-length": "13",
+        },
+        cloud,
+    )
+    for stripped in ("transfer-encoding", "te", "trailer", "upgrade", "keep-alive",
+                     "proxy-authorization", "proxy-authenticate", "connection",
+                     "host", "content-length"):
+        assert stripped not in out, f"{stripped} must not reach the upstream"
+    assert out["content-type"] == "application/json", "ordinary headers still pass through"
+
+
+def test_content_encoding_is_still_forwarded():
+    """The body goes upstream as received, so the header describing it must too.
+
+    Stripping it here would misdescribe the bytes. Whether an encoded body should be
+    accepted at all is a separate question from header hygiene.
+    """
+    cloud = Provider(name="gemini", base_url="https://example.invalid", is_local=False)
+    out = prepare_headers({"content-encoding": "gzip"}, cloud)
+    assert out["content-encoding"] == "gzip"
 
 
 def test_tap_counts_tool_calls():
@@ -166,3 +205,122 @@ async def test_canned_sse_shape():
     assert events[-1] == "data: [DONE]"
     first = json.loads(events[0].removeprefix("data: "))
     assert first["choices"][0]["delta"]["role"] == "assistant"
+
+
+def test_tap_reads_usage_from_a_non_streamed_completion():
+    """A client that omits `stream` gets one JSON object, not `data:`-framed events.
+
+    The SSE line parser finds no `data:` prefix anywhere in it, so usage never landed:
+    the request recorded tok=0/0 cost=0.0 and the per-key USD cap did not apply to
+    anyone who left `stream` at its OpenAI default of false.
+    """
+    tap = StreamTap(sse=False)
+    tap.feed(json.dumps({
+        "model": "gpt-4",
+        "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+            "role": "assistant",
+            "tool_calls": [{"id": "c1", "function": {"name": "exec", "arguments": "{}"}}],
+        }}],
+        "usage": {"prompt_tokens": 11, "completion_tokens": 6, "total_tokens": 17},
+    }).encode())
+    tap.close()
+
+    assert tap.result.prompt_tokens == 11
+    assert tap.result.completion_tokens == 6
+    assert tap.result.upstream_model == "gpt-4"
+    assert tap.result.tool_call_count == 1  # from `message`, not `delta`
+    assert tap.result.had_tool_calls
+
+
+def test_tap_in_sse_mode_does_not_parse_a_bare_json_body():
+    """Why the mode flag exists: in SSE mode an unframed body yields nothing."""
+    tap = StreamTap()  # sse=True, the default
+    tap.feed(b'{"usage":{"prompt_tokens":11,"completion_tokens":6}}')
+    tap.close()
+    assert tap.result.prompt_tokens == 0
+
+
+def test_tap_meters_sse_whatever_the_upstream_calls_it():
+    """Accounting must not depend on the upstream labelling its stream correctly.
+
+    Mode was taken from `content-type` alone, so an SSE upstream that omits the header —
+    or calls it `application/json` — parsed as neither shape: tok=0/0, model=None, and
+    the request accrued no spend while the client got a perfectly good stream. Omitting
+    it is the regression that matters, because before the tap had a mode at all it always
+    ran the SSE parser and got this right.
+    """
+    from agentgate.proxy.streaming import StreamTap
+
+    sse = (b'data: {"model":"m","usage":{"prompt_tokens":11,"completion_tokens":5}}\n\n'
+           b'data: [DONE]\n\n')
+    completion = json.dumps({
+        "model": "m",
+        "usage": {"prompt_tokens": 11, "completion_tokens": 5},
+        "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
+    }).encode()
+
+    for label, mode, payload in [
+        ("sse, declared", True, sse),
+        ("sse, no content-type", None, sse),
+        ("sse, mislabelled json", None, sse),
+        ("completion, sniffed", None, completion),
+        ("completion, declared", False, completion),
+    ]:
+        tap = StreamTap(sse=mode)
+        for i in range(0, len(payload), 7):  # chunked, so the sniff sees a partial head
+            tap.feed(payload[i:i + 7])
+        tap.close()
+        assert tap.result.prompt_tokens == 11, f"{label}: prompt tokens lost"
+        assert tap.result.completion_tokens == 5, f"{label}: completion tokens lost"
+        assert tap.result.upstream_model == "m", f"{label}: model lost"
+
+
+def test_buffered_tap_never_exceeds_its_cap():
+    """One oversized chunk must not carry the buffer past the bound the constant names."""
+    from agentgate.proxy.streaming import _MAX_BUFFERED_RESPONSE_BYTES, StreamTap
+
+    tap = StreamTap(sse=False)
+    for _ in range(12):
+        tap.feed(b"{" + b"x" * (1024 * 1024))
+    assert len(tap._buf) <= _MAX_BUFFERED_RESPONSE_BYTES
+
+    # And while the mode is still UNDECIDED, which is where the cap was not enforced at
+    # all: whitespace gives the sniff no first byte to judge on, and the early return
+    # that waits for one skipped the trim, so an upstream sending nothing but whitespace
+    # grew the buffer without bound — past the very cap this test exists to pin.
+    undecided = StreamTap(sse=None)
+    for _ in range(12):
+        undecided.feed(b" " * (1024 * 1024))
+    assert undecided._sse is None, "still undecided — that is the case under test"
+    assert len(undecided._buf) <= _MAX_BUFFERED_RESPONSE_BYTES
+
+
+def test_bom_prefixed_completion_is_not_mistaken_for_sse():
+    """A byte-order mark must not cost a request its accounting.
+
+    The shape sniff reads the first non-blank byte, and a BOM is not `{`, so an ordinary
+    JSON completion was parsed as SSE: no `data:` line ever arrived and the request
+    recorded zero tokens. A sender should not emit one (RFC 8259 §8.1) but a parser may
+    ignore it — `json.loads` already does, so the BOM broke nothing except the sniff.
+    """
+    completion = json.dumps({
+        "model": "m",
+        "usage": {"prompt_tokens": 11, "completion_tokens": 6},
+        "choices": [{"finish_reason": "stop"}],
+    }).encode()
+
+    cases = {
+        "one chunk": [b"\xef\xbb\xbf" + completion],
+        "BOM split": [b"\xef", b"\xbb", b"\xbf", completion],
+        "whitespace after BOM": [b"\xef\xbb\xbf", b" \r\n\t", completion],
+        "every byte split": [bytes([b]) for b in b"\xef\xbb\xbf \n" + completion],
+    }
+    for label, chunks in cases.items():
+        tap = StreamTap(sse=None)
+        for chunk in chunks:
+            tap.feed(chunk)
+        tap.close()
+
+        assert tap._sse is False, f"{label}: a BOM-prefixed completion is JSON, not SSE"
+        assert (tap.result.prompt_tokens, tap.result.completion_tokens) == (11, 6), label
+        assert tap.result.upstream_model == "m", label
