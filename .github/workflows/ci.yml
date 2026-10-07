@@ -11,33 +11,109 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        db: [sqlite, postgres]
+    services:
+      # Enables tests of shared spend counters and kill-switch propagation.
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+      # Both database jobs start PostgreSQL; only the postgres job uses it.
+      # scripts/test_postgres.sh runs the PostgreSQL tests locally.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: agentgate-test
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+        ports: ["5432:5432"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        # Use a specific release of the uv setup action.
+        uses: astral-sh/setup-uv@v9.0.0
         with:
           enable-cache: true
 
       - name: Set up Python
         run: uv python install
 
-      # `tracing` and `egress-mcp` are pure-Python and cheap, and without them their
-      # tests silently skip — including the pin that message content never reaches a
-      # span attribute. `guard` is deliberately omitted: it needs a pulled ONNX model,
-      # so its two smoke tests stay environment-gated.
+      # Install the extras needed for tracing, MCP and PostgreSQL tests.
+      # Tests that need the classifier's model files are skipped.
       - name: Install dependencies
-        run: uv sync --extra tracing --extra egress-mcp
+        run: uv sync --extra tracing --extra egress-mcp --extra pg
+
+      # Set the database URL only for PostgreSQL. Even an empty value would
+      # make conftest select the PostgreSQL test configuration.
+      - name: Run tests
+        env:
+          AGENTGATE_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+        run: |
+          if [ "${{ matrix.db }}" = "postgres" ]; then
+            export AGENTGATE_TEST_DATABASE_URL="postgresql+asyncpg://postgres:agentgate-test@127.0.0.1:5432/postgres"
+          fi
+          uv run pytest -q
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        # Use a specific release of the uv setup action.
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install dependencies
+        run: uv sync
 
       - name: Lint (ruff)
         run: uv run ruff check .
 
-      - name: Run tests
-        run: uv run pytest -q
+      # [tool.mypy] limits this check to src/agentgate.
+      - name: Type-check (mypy)
+        run: uv run mypy
 
-      # Keep the basic eval workflow usable from a fresh clone without keys or models.
-      - name: Eval harness smoke (offline, no keys)
-        run: uv run python -m eval.redteam score
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
 
-      - name: Report renders
-        run: uv run python -m eval.redteam report --out /tmp/redteam-results.md
+      - name: Install uv
+        # Use a specific release of the uv setup action.
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+
+      # Audit the core gateway plus tracing, MCP, PostgreSQL and guard dependencies.
+      # The LiteLLM plugin is outside this audit: it pins an exact LiteLLM release, whose
+      # proxy dependencies are not the gateway's.
+      - name: Export locked requirements
+        run: >
+          uv export --frozen --no-dev --no-emit-project
+          --extra tracing --extra egress-mcp --extra pg --extra guard
+          --format requirements-txt -o requirements-audit.txt
+
+      # Audit the exported versions without resolving or installing them again.
+      - name: pip-audit
+        run: uvx --python 3.13 pip-audit --strict --disable-pip -r requirements-audit.txt
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Build the gateway and mock, check streaming, audit and loopback port
+      # bindings, then stop the containers. Uses the same script as local checks.
+      - name: Container smoke
+        run: bash scripts/container_smoke.sh

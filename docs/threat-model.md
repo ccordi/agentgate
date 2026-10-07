@@ -1,115 +1,239 @@
----
-title: agentgate
----
-
 # Threat model
 
-This page states what the gateway defends and what remains out of scope. It assumes a
-**single-user deployment**: one operator, one host, and the gateway on
-loopback. This models what the *gateway* defends, not the host OS or the agent harness.
+agentgate checks model requests sent through the gateway and HTTP requests made
+by the supplied HTTP tool. It does not secure the host or sandbox the agent
+application. This page describes what those checks protect, what they rely on,
+and how they can fail.
+
+The intended deployment has a single operator and a single host, with the gateway
+reachable only through the host's loopback interface.
 
 ## Assets
 
-- **Operator secrets and PII** in content the agent can reach — config files, emails,
-  repos, anything a tool call can pull into context.
-- **Provider API keys in transit.** The gateway stores no provider keys; the inbound
-  auth header passes through it on every cloud call.
-- **The agent's ability to act** — its tool privileges (HTTP, shell, files). An
-  injection doesn't steal a credential so much as borrow the agent that holds one.
-- **Integrity of the operator's instructions** — the agent acting on what the operator
-  asked, not on what a document told it.
+- **Private data:** credentials, emails, configuration files and other content the
+  agent can read, including API keys used to access model providers.
+- **The operator's task:** instructions and constraints that external content might
+  try to override.
+- **Access to tools and model resources:** permission to read files, run commands,
+  make network requests and spend money on model calls.
 
-## Adversary
+## Attack vectors
 
-**Capability: authors content the agent will read.** Web pages, emails, retrieved
-documents, tool results, tool/MCP catalog descriptions. Nothing more is needed —
-EchoLeak was exactly this capability, exercised zero-click.
+The attacker can't instruct the agent directly. Instead, they supply content the
+agent reads through its tools, such as web pages, emails and documents, and try to
+make the agent follow instructions hidden in it.
 
-Explicit **non**-capabilities:
+The agent application sends each tool's description to the model with every
+request, and an attacker can sometimes control that text, for example when it comes
+from a remote MCP (Model Context Protocol) server, a service that supplies tools to the
+agent.
 
-- **Cannot modify the client or harness.** An agent running a maliciously rewritten
-  harness is out of scope (last section) — the PEP is code the harness chooses to run.
-- **Cannot intercept loopback traffic** between agent, gateway, and local model. A
-  separate adversary already on the host is past what a gateway can do. Two notes on
-  what this exclusion does *not* cover. First, the agent: it is on the host by
-  construction, and loopback destinations are always allowed by the egress policy — so
-  reaching the gateway's own ports is not something the egress policy prevents. The
-  admin plane (`/admin/kill/*`) and the egress PDP therefore require **dedicated bearer
-  tokens** (`AGENTGATE_ADMIN_TOKEN`, `AGENTGATE_PDP_TOKEN`) — the gateway refuses to
-  start without them, because an unarmed kill switch is clearable *by* the agent it
-  exists to halt. Second, the operator's browser: loopback excludes remote *sockets*,
-  not remote *code*. A web page can fire cross-origin requests at 127.0.0.1, and DNS
-  rebinding would make them same-origin — so the gateway also rejects any request whose
-  `Host` header is not a loopback name. The proxy routes remain unauthenticated by
-  design: a transparent proxy does not own the `Authorization` slot, so their inbound
-  auth is the loopback bind itself — which is why the bind is **enforced at startup**
-  (a non-loopback `AGENTGATE_HOST` refuses to serve, with deliberately no override
-  flag), not assumed.
-- **Is not the operator.** The local-LLM backend trusts the operator's turn by design and
-  scans only tool output. The heuristic and DeBERTa backends also scan the newest user
-  turn. [The essay](index.md) reports the local-LLM backend's operator-channel check and
-  explains why its result is format-sensitive.
+A web page open in the operator's browser can also send requests to the gateway,
+because browsers can reach services on the local machine.
 
-## Trust boundaries
+## Assumptions
 
-1. **Operator turn vs. tool/retrieval channel, on the model wire.** By the time text
-   reaches the model the two are indistinguishable; the channel it arrived on is the
-   durable signal, and it's visible on the wire. Every backend scans the untrusted
-   channel; the heuristic and DeBERTa backends also scan the newest user turn.
-2. **Model wire vs. client-side tool execution.** The proxy sees everything the model
-   reads and says; it cannot see what the agent *does* — tools execute in the harness,
-   off the wire. So the egress decision (PDP, on the gateway) is split from its
-   enforcement (PEP, inside the harness).
-3. **The host boundary.** Content classified sensitive is routed to the on-device
-   model and never leaves the host — which is why redaction is a cloud-route concern
-   only.
+- **The agent application labels messages correctly.** Each scanner chooses what to
+  check by message role. Outside content labeled as a user message is not checked by
+  the LLM judge.
+- **Tools that send data use the supplied HTTP tool.** Other tools, shell commands and
+  scripts don't ask the gateway.
+- **Cloud providers can be trusted with what they receive.** Routing and redaction
+  reduce what is sent to a cloud provider; they don't control what the provider does
+  with it.
+- **The attacker cannot modify the agent application or the gateway**, or intercept
+  local traffic between the application, gateway and model.
 
-## Controls → threats
+## Threats and mitigations
 
-Paths are relative to `src/agentgate/`.
+### Unwanted requests to the gateway
 
-| Threat | Example | Control | Where | Residual risk |
-|---|---|---|---|---|
-| Indirect injection in tool/retrieval output | Instruction buried in a fetched email or web page (EchoLeak-style) | Inbound scan of the untrusted channel — heuristic patterns, DeBERTa classifier (the default), opt-in local-LLM guard; a hard verdict is a 400 before the model ever sees the content | `guards/heuristic.py`, `guards/deberta.py`, `guards/local_llm.py`, dispatched from `pipeline.py` | Payloads scoring below the block threshold get through. DeBERTa scans at most 16 overlapping windows per item; the LLM backend is bounded by the local server's context limit and may reject or truncate oversized input. Content the model restates lands in assistant history, which the gateway trusts and does not re-scan |
-| Injection via tool-catalog descriptions | A `tools[]` entry whose description says "ignore previous instructions and…" | Static inspection of every `tools[]` definition; the hard tier (instruction injection in a description field) blocks with a 400 | `tool_inspector.py` | The soft tier — suspicious names, overly-broad or empty descriptions — is record-only: logged and audited, never blocked, until false-positive data justifies more |
-| Operator secrets/PII egressing to a cloud model | An API key in a config file the agent read, about to be forwarded upstream | Sensitivity classification routes sensitive content to the on-device model (zero egress); secrets/PII are redacted from anything that does go to cloud | `sensitivity.py`, `routing.py`, `redaction.py`, applied on cloud routes in `pipeline.py` | Regex + entropy detection over a bounded slice of the conversation — a secret with a novel shape, or one that falls outside the classified window in a long session, can slip the patterns |
-| Exfiltration via agent *actions* | Agent POSTs a secret-bearing file to a non-allowlisted host | Egress PDP decides on destination allowlist × payload sensitivity; the PEP — the harness's only network tool — consults it before every request and fails closed if the PDP is unreachable | `egress/policy.py`, `egress/api.py` (PDP); `egress/pep.py`, `egress/mcp_server.py` (PEP) | Cooperative only: it gates the sanctioned path, and ungated paths — shellout above all — walk around it (next section) |
-| Runaway spend loops | An agent stuck re-calling a cloud model | Per-key rolling-window USD cap on cloud routes; breaching it trips a **sticky** kill switch (halt, not throttle); local routes get a request-count cap | `limits/spend.py` | Loops under the cap run to completion, and spend is estimated from token counts, not billed truth; a request the client cuts off mid-stream records **zero** cost, because usage arrives in the stream's final event, so hanging up early accrues nothing against the cap; and the key is whatever the client says it is — this is accounting for one cooperative operator, not a tenancy boundary |
-| Sensitive data in the gateway's own audit trail | A captured content sample containing user text | Samples are redacted **then** encrypted at rest, carry a TTL, and are swept; with no encryption key configured, capture is skipped entirely — fail-closed, never plaintext; local-route and sensitive requests are never content-captured | `audit/crypto.py`, `audit/models.py`; capture decision in `pipeline.py` | The metadata tier (no content) is retained indefinitely; whoever holds the host's key can read the samples; and the optional capture tap used to build the false-positive corpus writes raw text, by design, to a local file that is neither encrypted nor expired |
-| Any control's dependency being down | The on-device guard model isn't running | Startup fallback to the always-available heuristic scanner | `app.py` (startup probe), `guards/__init__.py` (`resolve_backend`), dispatched from `pipeline.py` | Only the startup case is handled; a mid-session failure of the local model surfaces as a request error, not as an unscanned forward |
-| The loopback assumption silently failing | `AGENTGATE_HOST=0.0.0.0` (the ordinary way a container ships), or a drive-by web page reaching 127.0.0.1 | Startup refuses a non-loopback bind (no override flag — the tokenless proxy has no credential to arm, so no config state makes a wide bind safe); mandatory bearer tokens on the admin plane and PDP; non-loopback `Host` headers rejected (kills DNS rebinding) | `config.py` (`validate_runtime_settings`), `app.py` (`LoopbackHostGuard`, `_check_admin_auth`), `egress/api.py` | A direct `uvicorn agentgate.app:app --host …` never consults settings and bypasses the bind check (the token checks still hold); blind cross-origin POSTs — unreadable responses, no credentials — can still burn local-model compute through the proxy |
+The gateway refuses to start unless it listens on a loopback address. In the
+supplied Docker setup, `AGENTGATE_CONTAINER_BIND` lets it listen on other addresses
+inside its container while Compose publishes the port only on the host's loopback
+interface; the gateway can't check that arrangement. Using this setting on a bare
+host, or starting the gateway's web server (Uvicorn) directly with another
+`--host`, bypasses the check.
 
-## Out of scope / unmitigated
+The admin API requires `AGENTGATE_ADMIN_TOKEN`, and the HTTP tool's policy checks
+require `AGENTGATE_PDP_TOKEN`. Both tokens must be set, with different values,
+before the gateway starts. A `Host` header check also limits DNS rebinding, where
+an attacker's domain is made to point at the local gateway. A remote caller that
+can reach the gateway can forge that header, so the check doesn't replace network
+restrictions.
 
-These are design boundaries, not claims of coverage:
+Model requests don't need a gateway-issued key by default, so a web page can still send
+requests that use the local model, even though the browser can't read the
+responses. Setting `AGENTGATE_REQUIRE_ISSUED_KEYS=true` requires a gateway-issued
+key on every model request; [credentials](configuration.md#credentials) explains
+what that changes.
 
-- **A malicious or modified client/harness.** This is cooperative enforcement, not
-  containment — a client that doesn't ask the PDP isn't governed by it.
-- **Shell and subprocess network paths.** `sh -c 'curl …'` clears a first-token `curl`
-  block; `python3` isn't gated at all; neither are `git push`, `npx`, `ssh`, or anything
-  written to a shell profile to run later. Closing these means gating those surfaces
-  too — or OS-level network sandboxing, a different problem.
-- **OS-level containment.** No sandbox, no network-namespace isolation; the gate holds
-  for an agent that asks.
-- **Multi-tenant isolation.** One operator; caps and kill switches are per-key
-  accounting, not tenant boundaries.
-- **Attacks that steer behavior without a plantable instruction.** If nothing
-  instruction-shaped ever arrives on the wire, there is nothing for a scanner to catch —
-  the gap the essay names right next to its recall numbers.
-- **Guaranteed audit delivery.** Audit writes are off the hot path and best-effort by
-  design — the trail is for post-hoc characterization, not for non-repudiation.
-- **Model-provider compromise.** The upstream provider is trusted with whatever the
-  gateway sends it; routing and redaction bound *what that is*, not what the provider
-  does with it.
+### Prompt injection in tool results
 
-## Evidence
+A fetched email or web page may contain instructions meant to redirect the
+agent. Before forwarding a request, the gateway scans the newest tool results
+the model hasn't answered yet. The built-in heuristic scanner and the classifier also scan the newest
+user message; they are cheap enough to run on everything. The LLM judge scans only
+tool results: each scan is a call to a language model, and it can flag benign user
+messages far more often than the classifier, so it is kept off the user message. The
+user message is normally the operator's own instruction, but it can also carry outside
+content, such as a file attached to the prompt or text pasted from an email. Content
+arriving that way is checked only by the heuristic scanner and the classifier, which
+catch fewer attacks than the LLM judge; with the LLM judge alone, it is not scanned at all.
 
-The measurements behind these controls — indirect-injection recall, the false-positive
-rate on the scanned channel, the operator-channel over-fire check, the latency tiers —
-are stated in [the design essay](index.md) rather than repeated here. Reproduction
-commands, corpus provenance, and the expected-miss taxonomy
-live in `eval/redteam/README.md`.
+Two consecutive requests from one conversation, in which the model reads an
+email and then fetches a web page:
 
----
+![Each tool result is scanned once, on the request where it arrives, by the selected scanner; the operator's instruction is checked on each request by the heuristic scanner and the classifier; the model's replies are never scanned.](diagrams/scan-surface.svg)
 
-← Back to the [agentgate overview](index.md).
+When a scanner blocks, the gateway rejects the request with HTTP 400 before it
+reaches the model. With the heuristic scanner, content that looks suspicious but
+scores below the blocking threshold is recorded in the audit log and allowed
+through; the classifier and the LLM judge either block or allow.
+
+The scan has limits:
+
+- Scanners can miss injected instructions and flag benign content; the
+  [results](results.md#scanner-accuracy) give each scanner's rates.
+- The classifier reads at most about 26,000 characters of each message
+  it scans; the rest isn't scanned. The LLM judge sends each tool result whole,
+  so one longer than its model's context window either fails the scan, which
+  rejects the request, or is cut short by the model server.
+- Tool results the model has already answered, and the model's own earlier
+  replies, are not scanned again. This saves time and avoids repeat false
+  alarms, but leaves earlier content outside the scan.
+
+### Prompt injection in tool descriptions
+
+A tool's description is written for the model, and the agent application sends
+it with every request. A malicious tool can hide instructions there.
+[Invariant Labs showed this](https://invariantlabs.ai/blog/mcp-security-notification-tool-poisoning-attacks)
+in April 2025 with an `add` tool from an MCP server whose description told the
+model to read the operator's MCP configuration and SSH private key, pass them in
+a spare parameter, and keep quiet about it. Cursor's agent did as told.
+
+The gateway checks every tool definition in a request for phrases that give
+orders rather than describe the tool, such as "ignore previous instructions",
+"do not mention" or "exfiltrate". It reads the tool's description and the
+descriptions and allowed values in its parameter schema, and rejects the request
+with HTTP 400 on a match. Because tool definitions arrive with every request, a
+description that changes after the operator first approved the tool is checked
+again. Suspicious names such as `exec` or `curl`, descriptions that promise to
+do anything, and empty descriptions are recorded in the audit log but don't
+block.
+
+The check reads what a description says, not what a tool's code does, and it
+matches fixed phrases. The demonstration above is caught by its "do not mention"
+line; the same instructions without that line would pass. A tool with an
+ordinary description and malicious code passes too:
+[a package published in September 2025](https://thehackernews.com/2025/09/first-malicious-mcp-server-found.html)
+was a copy of a real email-sending tool with one added line that copied every
+email to its publisher.
+
+### Sensitive data sent to a cloud model
+
+The agent's conversation can carry credentials, personal data and private code,
+and a request sent to a cloud provider takes all of it off the machine.
+
+Each request's conversation is checked for sensitive content with fixed patterns:
+private keys, API keys and tokens of common shapes, password assignments, long
+high-entropy strings, email addresses, phone numbers, and card and social security
+numbers.
+Sensitivity routing is on by default, and a request with a match goes to the
+local model. Both routes point at the local model until the operator names a
+cloud provider, so a fresh install sends nothing off the machine. A request that
+does go to a cloud provider has each detected item replaced with a label such as
+`[REDACTED:email]` before sending, in message content and tool-call arguments
+alike. [Providers and models](configuration.md#providers-and-models) covers the
+routing settings.
+
+These patterns detect only sensitive data with an easily matched shape. Data in an
+unknown shape, or with no fixed shape at all, such as a person's name, passes
+undetected.
+
+The routing check runs on every request, and every request carries the whole
+conversation so far. To keep the check fast, it reads only the first 20,000
+characters of that conversation, which an agent session can pass within a few
+turns. From then on, sensitive content in newer turns does not change the route.
+The redaction step is quick and always applies to the entire conversation, so
+sensitive data detected via the pattern matcher is still redacted before a cloud
+request is sent.
+
+### Sensitive data sent through HTTP tools
+
+Injected instructions often aim to make the agent send private data to an attacker,
+such as by posting a file to a website the attacker controls.
+
+The supplied HTTP tool asks the gateway for a decision before each request and
+only attempts the request if the gateway allows it. The gateway allows any
+request to a destination on the operator's allowlist or on the local machine,
+except to the gateway's own address, which must be allowlisted explicitly. For
+any other destination, it checks the request's address, header values and body with
+the same patterns as the routing check above and denies the request on a match. The
+[write-up](index.md#checking-http-requests-made-by-tools) explains the design,
+and the [OpenCode guide](opencode.md#http-requests-made-by-tools) shows the
+setup.
+
+The check covers only requests made through that tool, as noted under
+Assumptions. It reads only the first 1,000,000 characters of a request, so
+anything after that point is not checked. It also inherits the pattern matching's
+limits: sensitive data that no pattern matches leaves freely, and a destination on
+the allowlist receives anything.
+
+### Runaway spending
+
+An agent stuck in a loop, or one steered by injected instructions, can call a
+paid model over and over.
+
+The gateway estimates the cost of each cloud request from its reported token
+counts and adds it to a per-key total for a fixed window that starts with the
+key's first request. When the total reaches the key's
+[spending cap](configuration.md#spending), the gateway trips a kill switch: every
+further request on that key gets HTTP 429 until the operator clears the switch
+through the admin API. Local models have no per-request
+price, so the gateway counts their requests against a separate cap instead. Responses from models
+without a price entry, or that are cut short before their final token counts
+arrive, are counted as zero cost and add nothing to the total. The
+[audit guide](audit.md#cost-estimates) explains how costs are estimated.
+
+### Sensitive data in audit storage
+
+The gateway keeps a record of the requests it handles on disk;
+[missing records](audit.md#missing-records) lists the exceptions. Each record is a
+metadata row: time, an identifier derived from the client's credential, the model and
+provider, the sensitivity class, scanner scores and flags, token counts and
+cost. These rows are kept indefinitely and are not encrypted, so anyone who can
+read the database file can read them. Message content is stored only when the
+operator sets an [encryption key](configuration.md#audit-storage), and never for
+requests sent to a local model or classified as sensitive; the Configuration page
+lists which other requests are saved and for how long. What is stored is the
+scanned content, the newest tool results and user message, redacted and then
+encrypted. The [audit guide](audit.md#saved-content) explains how to read it.
+
+### Scanner unavailable
+
+The gateway fails closed if a scanner can't run. If the classifier's
+model can't load, the gateway doesn't start. If a scan fails during a request,
+most likely because the LLM judge's model server is down or too slow, the
+gateway rejects the request with HTTP 503 and forwards nothing.
+
+## Out of scope
+
+- **The host and the agent application.** The gateway does not restrict what the
+  agent reads, runs, or sends through tools other than the supplied one.
+  Restricting arbitrary tool calls would require operating system controls, such
+  as a sandbox or firewall rules, which neither the gateway nor its Docker setup
+  provides.
+- **More than one operator.** Keys and limits are per client, but the audit
+  database, the admin token and the settings are shared, so the gateway does not
+  separate one person's data or control from another's.
+
+## Results and implementation
+
+The [write-up](index.md) explains the design, and the [Results](results.md) page gives
+the measurements.
+
+The main request checks are in [`pipeline.py`](https://github.com/ccordi/agentgate/blob/main/src/agentgate/pipeline.py).
+The HTTP policy is in [`egress/policy.py`](https://github.com/ccordi/agentgate/blob/main/src/agentgate/egress/policy.py), and
+[`egress/pep.py`](https://github.com/ccordi/agentgate/blob/main/src/agentgate/egress/pep.py) implements the tool's check before
+sending a request.

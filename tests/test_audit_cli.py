@@ -27,12 +27,11 @@ def _audit(**overrides) -> RequestAudit:
 
 
 @pytest.fixture
-async def store(tmp_path, monkeypatch):
+async def store(audit_db_url, monkeypatch):
     """A seeded temp store, with get_settings() pointed at it."""
     from agentgate import config
 
-    db = tmp_path / "audit.db"
-    url = f"sqlite+aiosqlite:///{db}"
+    url = audit_db_url
     s = AuditStore(url)
     await s.init()
 
@@ -60,7 +59,7 @@ async def test_tail_renders_seeded_rows(store, capsys):
     out = capsys.readouterr().out
     assert "TIME" in out and "PROVIDER" in out
     assert "continue" in out and "capture" in out
-    assert "0.90!" in out            # hard verdicts carry the ! suffix
+    assert "0.9000!" in out           # hard verdicts carry the ! suffix
     assert "$0.00010" in out
 
 
@@ -90,7 +89,7 @@ async def test_timestamps_are_converted_from_utc_not_relabelled(store, capsys):
     """SQLite hands `ts` back naive, and `astimezone()` treats naive as *local*.
 
     Calling it directly relabels a UTC clock reading as local time rather than
-    converting it, so every row in `tail` was off by the operator's UTC offset —
+    converting it, so every row in `tail` would be off by the operator's UTC offset —
     invisibly, since only %H:%M:%S is shown, so the date rollover doesn't show either.
     """
     ts = datetime(2026, 7, 31, 3, 4, 5, tzinfo=UTC)

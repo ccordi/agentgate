@@ -4,10 +4,10 @@ Imports are lazy, so without the extra the gateway runs identically: ``setup_tra
 ``capture_parent`` and ``record_chat`` are no-ops. With it, each request gets the FastAPI
 server span plus one ``chat`` span carrying the audit row's metadata fields as
 GenAI-semconv attributes — never message content. The extra carries the OTLP exporter, so
-``AGENTGATE_OTLP_ENDPOINT`` exports spans to any OTLP/HTTP sink.
+``AGENTGATE_OTLP_ENDPOINT`` (environment or `.env`) exports spans to any OTLP/HTTP sink.
 
 **The audit DB stays the system of record**: span attributes mirror the row's fields, and
-the benchmark's per-stage latency decomposition comes from the DB's `latency_*_ms`
+the published per-stage latency figures come from the DB's `latency_*_ms`
 columns, not from spans.
 
     uv sync --extra tracing     # to actually get spans
@@ -16,9 +16,10 @@ columns, not from spans.
 from __future__ import annotations
 
 import logging
-import os
 import time
 from typing import Any
+
+from agentgate.config import env_setting
 
 log = logging.getLogger("agentgate.otel")
 
@@ -26,6 +27,12 @@ log = logging.getLogger("agentgate.otel")
 # absent (no tracer provider), True = an SDK tracer provider is installed. `capture_parent`
 # and `record_chat` only care about True, so they test it directly.
 _ACTIVE: bool | None = None
+
+
+def otlp_endpoint() -> str | None:
+    """``AGENTGATE_OTLP_ENDPOINT`` from the environment or `.env`; unset or empty means
+    spans are not exported."""
+    return env_setting("AGENTGATE_OTLP_ENDPOINT")
 
 
 def setup_tracing(app) -> None:
@@ -45,7 +52,7 @@ def setup_tracing(app) -> None:
 
     provider = TracerProvider(resource=Resource.create({"service.name": "agentgate"}))
 
-    endpoint = os.environ.get("AGENTGATE_OTLP_ENDPOINT")
+    endpoint = otlp_endpoint()
     if endpoint:
         try:
             from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter

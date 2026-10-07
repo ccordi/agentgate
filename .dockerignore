@@ -1,0 +1,12 @@
+# Only the files the image is built from enter the build context; everything else
+# (docs, tests, local data) stays out.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!src
+!bench
+# Re-excludes inside the allowed trees.
+**/__pycache__
+**/.pytest_cache

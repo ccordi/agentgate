@@ -1,4 +1,10 @@
-"""Mock upstream handlers for recording requests, bodies, and canonical streams."""
+"""Mock upstream handlers for the endpoint tests.
+
+One factory covers every variant the tests need: record the forwarded
+requests, log the forwarded bodies (egress proof — the gateway redacts *before*
+forwarding, so what lands here is what a cloud upstream would see), or just answer
+with the canonical stream.
+"""
 
 from __future__ import annotations
 
@@ -21,7 +27,7 @@ def sse_handler(
 
     `record` collects the forwarded requests; `body_log` collects their raw bodies.
     The stream is `bench.mock_upstream`'s canned fixture, so the usage chunk (11
-    prompt / 6 completion tokens) is the same one the load bench measures against.
+    prompt / 6 completion tokens) is the same one a load test against the mock sees.
     """
     def handler(request: httpx.Request) -> httpx.Response:
         if record is not None:

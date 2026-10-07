@@ -10,15 +10,12 @@ venv/
 # Env / secrets — never commit
 .env
 *.env
-openclaw.json
-!deploy/openclaw.json.example
 
 # Local data
 *.db
 *.sqlite
 *.sqlite3
-data/
-proxy-captures/
+/data
 
 # OS / editor
 .DS_Store
@@ -26,26 +23,9 @@ proxy-captures/
 *.swo
 *~
 
-# Red-team eval: per-run outputs + judge cache (regenerated, not source)
-eval/redteam/runs/
-# FP-capture raw captures contain arbitrary live web text and stay local. Only reviewed
-# items belong in the committed corpus.
-eval/redteam/corpus/fp_capture.jsonl
-# Regenerable gold-set sampling template (`gold_set.jsonl` is committed)
-eval/redteam/corpus/gold_set_unlabeled.jsonl
-# The labeler's working output. A finished round gets promoted into gold_set.jsonl —
-# committing both just leaves two copies of the same file to drift apart.
-eval/redteam/corpus/gold_set_labeled.jsonl
-# Benchmark run artifacts (k6 summaries); bench DB is under data/ (already ignored)
-bench/runs/
-
 # other
-notes/
 # Anchored with no trailing slash so this covers both the directory and a symlink.
 /models
-tmp/
 
-# Local worktrees
-.worktrees/
-# Local-only Claude permission overrides
-.claude/settings.local.json
+# On-demand OTel receiving stack writes its span export here (bind mount).
+deploy/otel-export/

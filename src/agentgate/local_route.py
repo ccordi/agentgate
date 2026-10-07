@@ -1,12 +1,14 @@
 """Local-route request adaptation — a client-compatibility adapter, not a security control.
 
-Two unrelated jobs, both scoped to the local (`is_local`) upstream and both default-off:
+Two unrelated jobs, both scoped to the local (`is_local`) upstream. The overrides apply
+only when set; the cleaning always runs:
 
-1. **Env-driven overrides** (`AGENTGATE_LOCAL_*`) so a scoped debug session can sweep the
-   local server's model / stop list / token cap / reasoning flag via a restart alone.
-2. **System-prompt cleaning.** Some clients staple a Gemini-style `<think>…</think>` +
-   `<final>…</final>` wrapping instruction into the system prompt. That conflicts with a
-   local model's own chat template, so the block is swapped for a short equivalent.
+1. **Env-driven overrides** (`AGENTGATE_LOCAL_*`) so the local server's model, stop list,
+   token cap and reasoning flag can be changed with a restart, without a code change.
+2. **System-prompt cleaning.** Some agent frameworks staple a Gemini-style
+   `<think>…</think>` + `<final>…</final>` wrapping instruction into the system prompt.
+   That conflicts with a local model's own chat template, so the block is swapped for a
+   short equivalent.
 
 Nothing here inspects untrusted content or makes a trust decision. It rewrites the
 operator's own outbound request for a specific server's benefit — if it stopped working
@@ -21,8 +23,8 @@ from collections.abc import Callable, Iterator
 
 log = logging.getLogger("agentgate")
 
-# Matches the client-injected thinking/final wrapping instructions. Lazy matching, so
-# small edits across client prompt-template versions still match.
+# Matches the Gemini-specific thinking/final wrapping instructions such frameworks
+# inject. Lazy matching, so small edits across prompt-template versions still match.
 _SYSTEM_PROMPT_CLEAN_RE = re.compile(
     r"ALL internal reasoning MUST be inside <think>.*?</think>\..*?"
     r"Format every reply as <think>.*?</think> then <final>.*?</final>.*?"

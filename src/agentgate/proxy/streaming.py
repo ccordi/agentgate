@@ -1,7 +1,7 @@
 """SSE passthrough + async response tap.
 
 The gateway streams the upstream SSE response straight back to the client (no
-buffering — keeps the p99 benchmark clean), while *teeing* the same bytes into a
+buffering, which keeps tail latency low), while *teeing* the same bytes into a
 tap that extracts usage and finish_reason for accounting.
 
 Response content is NOT scanned: the tap reads only model, usage, finish_reason and
@@ -57,11 +57,11 @@ class StreamTap:
         # is accumulated whole and parsed at close instead of line by line.
         #
         # `None` means "decide from the bytes". Keying the mode off the upstream's
-        # `content-type` alone made a header the accounting depended on: an SSE upstream
-        # that omits it — or labels it `application/json` — parsed as neither, and the
-        # request accrued no spend at all while the client got its stream. A completion is
-        # always a JSON object, so the first non-blank byte separates the two shapes
-        # without trusting anyone.
+        # `content-type` alone would make the accounting depend on a header: an SSE
+        # upstream that omits it — or labels it `application/json` — would parse as
+        # neither, and the request would accrue no spend at all while the client got its
+        # stream. A completion is always a JSON object, so the first non-blank byte
+        # separates the two shapes without trusting anyone.
         self._sse = sse
         self._buf = b""
 
@@ -94,7 +94,7 @@ class StreamTap:
                 # Leading whitespace (or a lone BOM) — no first byte to judge on yet. The
                 # buffer is being HELD, not drained, so it is capped here too: an upstream
                 # that sends nothing else must not grow it past the bound while the mode
-                # is still undecided. Returning before the trim was a live cap bypass.
+                # is still undecided.
                 self._trim()
                 return
             self._sse = not head.startswith((b"{", b"["))
@@ -184,7 +184,7 @@ class StreamTap:
             tcs = delta.get("tool_calls")
             if isinstance(tcs, list):
                 # Each tool call streams across multiple deltas; count only the ones
-                # that announce a new call (carry an index with a function name).
+                # that announce a new call (carry a function name).
                 for tc in tcs:
                     if (tc.get("function") or {}).get("name"):
                         self.result.tool_call_count += 1

@@ -1,55 +1,56 @@
-"""Tier-3 egress PEP — stdio MCP server.
+"""Egress PEP — stdio MCP server.
 
 The live wiring for the `safe_http_request` PEP core (`egress/pep.py`).
-This exposes a single MCP tool over stdio that the harness registers as the *only*
-network-capable tool: with `Bash(curl*|wget*|fetch*)` and any built-in fetch tool
-excluded in the harness permissions config, every outbound HTTP request the agent
-makes flows through here, and therefore through the PDP (`POST /a/egress/decision`)
-first.
+This exposes a single MCP tool over stdio, and every request made through it goes to the
+PDP (`POST /a/egress/decision`) first. It covers only that tool: the agent application's
+permission settings can deny direct `curl`, `wget` and `fetch` commands and any built-in
+fetch tool (docs/opencode.md shows one setup), but a command wrapped in a shell, or a
+script, can still make unchecked requests.
 
 This server adds **no policy** — it is the PEP's transport shell. All adjudication
 lives in the PDP; all consult-then-perform-or-refuse logic lives in
-`egress/pep.py`. This module only: (1) marshals MCP tool arguments into a
-`safe_http_request` call, (2) supplies the PDP bearer from the environment, and
-(3) handles the carry-note — an outbound request can throw *after* the PDP allows it
+`egress/pep.py`. This module only: (1) marshals MCP tool arguments into a `safe_http_request`
+call, (2) supplies the PDP bearer from the environment or `.env`, and (3) handles a
+**post-verdict failure** — an outbound request can throw *after* the PDP allows it
 (DNS failure, connection refused, read timeout against the real destination), and
 `safe_http_request` lets that propagate. We catch it here and return a clean tool
 result instead of crashing the MCP server / surfacing an opaque stack trace to the
 model.
 
 Auth: the PEP is a concrete token-holding caller. It reads `AGENTGATE_PDP_TOKEN`
-from the environment and presents it as the PDP bearer. The PDP's auth is
-mandatory — the gateway refuses to start without the token — so an unset value
-here fails closed: the PDP 401s, `safe_http_request` reports it, nothing
-egresses. It deliberately does not read `AGENTGATE_LOCAL_API_KEY`; that is the
-local *upstream's* credential, and reusing it would span two trust boundaries
-with one value.
+from its environment or from the `.env` file in its working directory (an exported
+value wins) and presents it as the PDP bearer. The PDP's auth is mandatory — the gateway refuses
+to start without the token — so an unset value here fails closed: the PDP 401s,
+`safe_http_request` reports it, nothing egresses. It deliberately does not read
+`AGENTGATE_LOCAL_API_KEY`; that is the local *upstream's* credential, and reusing
+it would span two trust boundaries with one value.
 
-Run with the extra installed:
+Run from the agentgate checkout, with the extra installed:
 
     uv run --extra egress-mcp python -m agentgate.egress.mcp_server
 """
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from agentgate.config import env_setting
 from agentgate.egress.pep import DEFAULT_PDP_URL, safe_http_request
 
 mcp = FastMCP("agentgate-egress")
 
 
 def _bearer() -> str | None:
-    """PDP bearer from the environment. None fails closed at the PDP (401), not open."""
-    return os.environ.get("AGENTGATE_PDP_TOKEN") or None
+    """PDP bearer from the environment or `.env` in the working directory. None fails
+    closed at the PDP (401), not open."""
+    return env_setting("AGENTGATE_PDP_TOKEN") or None
 
 
 def _pdp_url() -> str:
-    """Allow override of the PDP endpoint via env; default to the loopback proxy."""
-    return os.environ.get("AGENTGATE_PDP_URL") or DEFAULT_PDP_URL
+    """The PDP endpoint from the environment or `.env`; default the loopback proxy."""
+    return env_setting("AGENTGATE_PDP_URL") or DEFAULT_PDP_URL
 
 
 @mcp.tool()
@@ -83,8 +84,8 @@ def safe_http_request_tool(
           - status_code / response_headers / response_body: present iff executed
             and the outbound request succeeded.
           - error (str): present iff the request was allowed but the outbound call
-            then failed (DNS, connection refused, timeout, ...). The carry-note
-            path — surfaced cleanly, not raised.
+            then failed (DNS, connection refused, timeout, ...). Surfaced cleanly,
+            not raised.
     """
     try:
         result = safe_http_request(
@@ -96,12 +97,12 @@ def safe_http_request_tool(
             bearer=_bearer(),
         )
     except Exception as exc:
-        # Carry-note: the PDP allowed the request, but the outbound call itself threw
-        # inside `_perform_outbound`. Return a clean tool error rather than letting it
-        # crash the stdio server. Catch broadly (not just httpx.HTTPError) because
-        # httpx can raise non-HTTPError types for malformed agent input — e.g.
-        # httpx.InvalidURL, which is NOT an HTTPError subclass — and a single uncaught
-        # exception kills the only sanctioned network path.
+        # The PDP allowed the request, but the outbound call itself
+        # threw inside `_perform_outbound`. Return a clean tool error rather than letting
+        # it crash the stdio server. Catch broadly (not just httpx.HTTPError) because
+        # httpx raises non-HTTPError types for malformed agent input — e.g.
+        # httpx.InvalidURL — and a single uncaught exception kills the only sanctioned
+        # network path.
         #
         # `safe_http_request` converts every pre-verdict failure into an explicit
         # `fail-closed:pep-error` deny before it can raise, so anything reaching here is

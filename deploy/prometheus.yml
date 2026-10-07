@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: agentgate
+    static_configs:
+      # Prometheus shares the gateway container's network namespace and scrapes
+      # its loopback address. This also supplies the loopback Host header required
+      # by the gateway.
+      - targets: ["127.0.0.1:4100"]

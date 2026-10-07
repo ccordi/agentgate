@@ -6,8 +6,8 @@ entropy only, runs inline on the hot path.
 
 Public surface:
   detect(text)  → [(hit_type, count)]          # shared primitive
-  redact(text)  → RedactionResult              # rewrites spans in-place
-  explain(text) → [(hit_type, matched_span)]   # off-hot-path: which substring fired
+  redact(text)  → RedactionResult              # returns the text with matched spans replaced
+  mask_url_password(url) → str                 # operator-facing log/exception text
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit, urlunsplit
 
 # ---------------------------------------------------------------------------
 # Detector patterns
@@ -36,7 +37,7 @@ SECRET_PATTERNS: list[tuple[re.Pattern, str]] = [
 
 PII_PATTERNS: list[tuple[re.Pattern, str]] = [
     # Require an alphabetic TLD (>=2) so version pins / IPs like `cache@v5.0.5` or
-    # `svc@10.0.0.1` aren't read as emails; real `.com`/`.invalid` addresses still match.
+    # `svc@10.0.0.1` aren't read as emails (real `.com`/`.invalid` keep matching).
     # Every quantifier is bounded. `.` is inside the local-part class, so an unbounded `+`
     # hands the engine a fresh start position every other character of a dot-rich run —
     # quadratic, on the event loop, on attacker-chosen input. The bounds sit above anything
@@ -64,6 +65,20 @@ _TOKEN_RE = re.compile(r"\b[A-Za-z0-9_\-]{32,}\b")
 _B64_BLOB_RE = re.compile(r"[A-Za-z0-9+/]{32,}={0,2}")
 _B64_MAX_SLASHES = 3
 _ENTROPY_BITS = 4.0
+
+# The shortest bare number any detector above can match. The shared JSON lexeme walker
+# (`content.map_json_lexemes` — the structural redactor and the sensitivity classifier
+# both read through it) scans a JSON number as its lexeme — digits, sign, `.`,
+# exponent — and nothing here matches one under 10 characters: phone needs 10 digits (11
+# with a leading 1), card 13–16, SSN needs dashes, email an `@`, the secret and assignment
+# shapes a word or prefix, `_TOKEN_RE` / `_B64_BLOB_RE` 32+ characters — and pure digits
+# carry log2(10) ≈ 3.32 bits per character, under `_ENTROPY_BITS` at any length. So a
+# caller may skip `redact()` for shorter numeric lexemes losslessly; the walker does,
+# which is what keeps numeric-heavy JSON (an array of small ints) from paying the
+# detectors' cost per element. Pinned by
+# `test_short_numeric_lexemes_match_no_detector`: if a detector ever matches a shorter
+# bare number, that test fails and this constant must drop with it.
+MIN_SCANNABLE_NUMBER_CHARS = 10
 
 
 # ---------------------------------------------------------------------------
@@ -131,39 +146,6 @@ def detect(text: str) -> list[tuple[str, int]]:
     return list(hits.items())
 
 
-def explain(text: str) -> list[tuple[str, str]]:
-    """Return [(hit_type, matched_substring)] — *why* ``detect`` fired, in order.
-
-    A debugging affordance, not a hot-path call: it walks the patterns a second time and
-    keeps every match rather than counting. Used by the over-fire report
-    (``eval/redteam/classifier_eval.py``) to root-cause a firing back to the exact
-    offending span, and useful by hand when a redaction looks wrong.
-    """
-    out: list[tuple[str, str]] = []
-
-    for pat, name in SECRET_PATTERNS:
-        out.extend((name, m.group(0)) for m in pat.finditer(text))
-
-    # Mirror both branches of detect()'s high-entropy check so the offender is never
-    # blank: a generic alnum/_/- run over the entropy floor, and a base64 blob carrying
-    # `+`/`/` that `_is_b64_secret` accepts.
-    out.extend(
-        ("high_entropy_token", tok)
-        for tok in _TOKEN_RE.findall(text)
-        if _shannon_bits(tok) >= _ENTROPY_BITS
-    )
-    out.extend(
-        ("high_entropy_token", tok)
-        for tok in _B64_BLOB_RE.findall(text)
-        if _is_b64_secret(tok)
-    )
-
-    for pat, name in PII_PATTERNS:
-        out.extend((name, m.group(0)) for m in pat.finditer(text))
-
-    return out
-
-
 def redact(text: str) -> RedactionResult:
     """Replace each matched span with '[REDACTED:<type>]'.
 
@@ -217,3 +199,35 @@ def redact(text: str) -> RedactionResult:
     hit_types = [{"type": t, "count": c} for t, c in counts.items()]
     total = sum(counts.values())
     return RedactionResult(redacted_text=out, hit_count=total, hit_types=hit_types)
+
+
+# ---------------------------------------------------------------------------
+# Connection URLs in operator-facing text
+# ---------------------------------------------------------------------------
+
+def mask_url_password(url: str) -> str:
+    """``url`` with the password in its userinfo replaced by ``***``.
+
+    Startup announces which audit store and which limits backend came up, and the
+    shared-limits refusal names the Redis it could not reach — all by interpolating the
+    configured URL. A URL with credentials in it (`postgresql+asyncpg://user:pw@host/db`,
+    `redis://user:pw@host:6379/0`) would therefore write the operator's password into the
+    log file, and into whatever collects the traceback; a log file is readable by more
+    people, for longer, than the config that holds the URL.
+
+    Only the password is touched: scheme, user, host and path stay readable, because the
+    line exists to tell the operator *which* backend this is. A URL with no userinfo —
+    the default `sqlite+aiosqlite:///./data/agentgate.db` among them — comes back
+    byte-identical, unparsed by anything that could mangle a filesystem path. For text a
+    human reads only; the value used to connect is always the original string.
+    """
+    try:
+        split = urlsplit(url)
+    except ValueError:
+        # An unparseable URL cannot be masked, and echoing it is the thing to avoid.
+        return "<unparseable url>"
+    if split.password is None:
+        return url
+    userinfo, _, host = split.netloc.rpartition("@")
+    user = userinfo.partition(":")[0]
+    return urlunsplit(split._replace(netloc=f"{user}:***@{host}"))

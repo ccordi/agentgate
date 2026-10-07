@@ -1,7 +1,7 @@
 """Canned-SSE mock upstream.
 
 Emits a deterministic OpenAI Chat Completions SSE stream — no token cost, no
-network — so the load benchmark measures pure gateway overhead (p99) and the
+network — so a load test measures the gateway's own overhead and the
 forwarder/tap can be tested end-to-end. Mirrors the chunk shape of a real
 OpenAI-compatible streaming SSE response.
 
@@ -76,8 +76,8 @@ app = FastAPI(title="mock-upstream")
 async def chat_completions(request: Request) -> StreamingResponse:
     # Body is accepted but ignored for response purposes — output is deterministic by
     # design. When MOCK_LOG_BODIES is set (a file path), append the raw body received
-    # (one JSON line) — this serves as egress proof (the gateway redacts
-    # before forwarding, so what lands here is what the cloud upstream would see).
+    # as one JSON line. The gateway redacts before forwarding, so the logged body is
+    # what the upstream receives.
     body = await request.body()
     log_path = os.environ.get("MOCK_LOG_BODIES")
     if log_path:

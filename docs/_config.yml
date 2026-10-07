@@ -1,9 +1,13 @@
 theme: jekyll-theme-cayman
 title: agentgate
-description: A transparent reverse-proxy safety gateway for LLM agents.
+description: A reverse proxy that adds controls and monitoring between an agent application and its model.
 
 defaults:
   - scope:
       path: ""
     values:
       layout: default
+
+# Pages without front matter are published as pages only, not also as raw .md copies.
+optional_front_matter:
+  remove_originals: true

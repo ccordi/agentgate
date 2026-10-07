@@ -1,4 +1,4 @@
-"""Tier-3 egress PEP — `safe_http_request` policy-client core.
+"""Egress PEP — `safe_http_request` policy-client core.
 
 Framework-free, import-and-call module. This is the **enforcement point** for
 outbound network egress from agent-invoked tools: before performing an HTTP
@@ -7,7 +7,7 @@ its verdict verbatim.
 
 This module emits **no policy of its own** — it never inspects payload
 sensitivity or destinations itself; it only asks the PDP and obeys ("thin
-client, all policy in the PDP"). It is muscle, not brain.
+client, all policy in the PDP").
 
 Fail-closed: if the PDP is unreachable, times out, returns a non-2xx
 status, or returns an unparseable response, the call is **denied**. An
@@ -24,7 +24,7 @@ from typing import Any
 
 import httpx
 
-# Default PDP endpoint — the loopback proxy's tier-3 advisory endpoint.
+# Default PDP endpoint — the loopback proxy's egress decision endpoint.
 DEFAULT_PDP_URL = "http://127.0.0.1:4100/a/egress/decision"
 
 # PDP latency tolerance is high (a caller waiting 200ms on a loopback PDP is fine);
@@ -117,11 +117,19 @@ def _perform_outbound(
     timeout: float,
     client: httpx.Client | None,
 ) -> OutboundResult:
-    """Perform the actual outbound HTTP request (only called on PDP `allow`)."""
+    """Perform the actual outbound HTTP request (only called on PDP `allow`).
+
+    `follow_redirects=False` is stated explicitly. It is load-bearing — a 302 to
+    a non-allowlisted host must come back as a 302, not be chased past the gate the PDP
+    just applied to the *original* URL. httpx defaults to it, but stating it per request
+    means a caller-supplied `outbound_client` configured with redirects enabled cannot
+    silently void the gate, and the property is pinned rather than inherited.
+    """
     owns_client = client is None
     http_client = client or httpx.Client(timeout=timeout)
     try:
-        response = http_client.request(method, url, headers=headers, content=body)
+        response = http_client.request(method, url, headers=headers, content=body,
+                                       follow_redirects=False)
         return OutboundResult(
             status_code=response.status_code,
             headers=dict(response.headers),
@@ -146,14 +154,14 @@ def safe_http_request(
     pdp_client: httpx.Client | None = None,
     outbound_client: httpx.Client | None = None,
 ) -> EgressResult:
-    """Tier-3 PEP entrypoint: consult the PDP, then perform-or-refuse.
+    """PEP entrypoint: consult the PDP, then perform-or-refuse.
 
     Parameters
     ----------
     url, method, headers, body:
         The outbound HTTP request the agent wants to make.
     pdp_url:
-        The agentgate tier-3 egress decision endpoint (default: loopback `:4100`).
+        The agentgate egress decision endpoint (default: loopback `:4100`).
     pdp_timeout:
         Timeout (seconds) for the PDP request. On timeout: fail-closed (deny).
     outbound_timeout:
@@ -182,10 +190,10 @@ def safe_http_request(
     # reports "egress permitted by policy, but the outbound request failed" — true for a
     # post-verdict failure, and a lie for anything that happens BEFORE the PDP was ever
     # consulted (e.g. httpx.InvalidURL on a malformed AGENTGATE_PDP_URL, which is not an
-    # HTTPError subclass and so slipped past the handlers below). Nothing egressed in that
-    # case, but telling the model policy permitted it invites a retry on another path.
+    # HTTPError subclass and so would slip past the handlers below). Nothing egressed in
+    # that case, but telling the model policy permitted it invites a retry on another path.
     # Converting every pre-verdict failure into an explicit fail-closed deny here makes the
-    # shell's carry-note true by construction, rather than by a sentinel it has to check.
+    # shell's message true by construction, rather than by a sentinel it has to check.
     try:
         pdp_payload = _build_pdp_request(
             url=url, method=method, headers=headers, body=body, context=context
@@ -266,7 +274,7 @@ def safe_http_request(
 
     # decision == "allow" -> perform the actual outbound request. Everything above this
     # line is guaranteed not to raise (see the pre-PDP guard), so any exception escaping
-    # this function is post-verdict — which is what makes the MCP shell's carry-note
+    # this function is post-verdict — which is what makes the MCP shell's error message
     # ("permitted by policy, but the outbound request failed") a true statement.
     outbound = _perform_outbound(
         url=url,

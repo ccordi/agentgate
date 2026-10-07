@@ -1,0 +1,126 @@
+# Gateway and mock model server, with optional observability services. Setup and use:
+# docs/docker.md.
+#
+# Profiles:
+#   gateway — gateway and mock model server.
+#   obs     — Redis, Prometheus and Grafana. Prometheus shares the gateway's
+#             network namespace, so start these profiles together:
+#             docker compose --env-file .env -f deploy/docker-compose.yml --profile gateway --profile obs up -d
+#             Redis alone: docker compose -f deploy/docker-compose.yml up -d redis
+#   otel    — trace collector and Tempo, without a gateway. This leaves port
+#             4100 free for a gateway run on the host:
+#             docker compose -f deploy/docker-compose.yml --profile otel up -d
+#             docker compose -f deploy/docker-compose.yml --profile otel down
+#
+# Published ports bind to 127.0.0.1 on the host. AGENTGATE_CONTAINER_BIND allows
+# the gateway to listen on all interfaces inside its container's network namespace.
+# The mock shares that namespace so the configured 127.0.0.1:4200 address reaches
+# it. Prometheus shares the namespace to scrape the gateway on loopback, supplying
+# the loopback Host header required by the gateway.
+#
+# The trace collector sends spans to Tempo and also writes JSON lines to
+# deploy/otel-export/spans.jsonl on the host, where they survive container shutdown.
+
+services:
+  agentgate:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: agentgate:dev
+    profiles: [gateway]
+    environment:
+      # Leave missing tokens empty so other profiles can start independently.
+      # The gateway validates its tokens at startup and names any missing setting.
+      AGENTGATE_ADMIN_TOKEN: ${AGENTGATE_ADMIN_TOKEN:-}
+      AGENTGATE_PDP_TOKEN: ${AGENTGATE_PDP_TOKEN:-}
+      AGENTGATE_HOST: 0.0.0.0
+      AGENTGATE_CONTAINER_BIND: "1"
+      AGENTGATE_DEFAULT_PROVIDER: ${AGENTGATE_DEFAULT_PROVIDER:-mock}
+      # Demo defaults; settings in .env can select a real model server.
+      AGENTGATE_ROUTING__ENABLED: ${AGENTGATE_ROUTING__ENABLED:-false}
+      # Use the heuristic scanner; the image contains no classifier model files.
+      AGENTGATE_GUARD_BACKEND: ${AGENTGATE_GUARD_BACKEND:-heuristic}
+      # Unset entries are omitted from the container environment. Values come from
+      # the shell or the explicit --env-file, including a file outside the checkout.
+      AGENTGATE_PROVIDERS:
+      AGENTGATE_LOCAL_MODEL_OVERRIDE:
+      AGENTGATE_LOCAL_API_KEY:
+      AGENTGATE_EGRESS__ALLOWLIST:
+    volumes:
+      - agentgate-data:/app/data
+    ports:
+      - "127.0.0.1:${AGENTGATE_PUBLISH_PORT:-4100}:4100"
+      # Publish Prometheus from the shared namespace when the obs profile runs.
+      - "127.0.0.1:9090:9090"
+
+  mock:
+    image: agentgate:dev
+    # Use the local image built for the gateway service.
+    pull_policy: never
+    profiles: [gateway]
+    # Shares the gateway's namespace: binds 127.0.0.1:4200 right next to it.
+    network_mode: "service:agentgate"
+    command: ["python", "-m", "bench.mock_upstream"]
+    healthcheck:
+      disable: true # the image healthcheck probes the gateway's port, not the mock's
+    depends_on:
+      - agentgate
+
+  redis:
+    image: redis:7-alpine
+    profiles: [obs]
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:6379:6379"
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    profiles: [obs]
+    network_mode: "service:agentgate"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - agentgate
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    profiles: [obs]
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      # Anyone who can reach the port gets read-only (Viewer) access without logging in.
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_SECURITY_ALLOW_EMBEDDING=true
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on:
+      - prometheus
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.131.0
+    profiles: [otel]
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol/config.yaml:ro
+      - ./otel-export:/export
+    ports:
+      # OTLP/HTTP for the host gateway (AGENTGATE_OTLP_ENDPOINT); localhost only.
+      - "127.0.0.1:4318:4318"
+    depends_on:
+      - tempo
+
+  tempo:
+    image: grafana/tempo:2.8.1
+    profiles: [otel]
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./tempo.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      # Local query API for Grafana and trace checks.
+      - "127.0.0.1:3200:3200"
+
+volumes:
+  agentgate-data:
+  tempo-data:

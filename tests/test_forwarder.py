@@ -1,6 +1,6 @@
-"""End-to-end forwarder tests: gateway -> mock upstream, both over ASGI (no network).
+"""End-to-end forwarder tests: gateway -> mock model server, both over ASGI (no network).
 
-Verifies two core invariants: SSE streams through byte-for-byte,
+Verifies the two things the forwarder must get right: SSE streams through byte-for-byte,
 and the tap extracts usage / finish_reason / tool-call signals from the stream.
 """
 
@@ -151,12 +151,11 @@ def test_tap_counts_tool_calls():
 
 
 async def test_forward_decodes_gzipped_upstream():
-    """Regression: a gzip-compressed upstream response must reach the client as
-    *decoded* SSE (we strip content-encoding), and the tap must still parse it.
+    """A gzip-compressed upstream response reaches the client as decoded SSE, without its
+    content-encoding header, and the tap still reads usage from it.
 
-    Caught in production: aiter_raw() forwarded compressed bytes with the
-    content-encoding header stripped -> client got undecodable data
-    ('incomplete_result') and the tap saw model=None/tokens=0. aiter_bytes() fixes both.
+    Forwarding the compressed bytes without the header would hand the client data it
+    cannot decode.
     """
     sse = b""
     async for c in canned_sse():
@@ -189,15 +188,16 @@ async def test_forward_decodes_gzipped_upstream():
 
 
 def test_chat_completions_route_accepts_both_paths():
-    """Regression: some clients send /chat/completions (no /v1) when baseUrl lacks the
-    version segment. Both path forms must be registered."""
+    """OpenAI-compat clients send /chat/completions (no /v1) when baseUrl
+    lacks the version segment. Both path forms must be registered."""
     paths = {r.path for r in gateway_app.routes}
     assert "/v1/chat/completions" in paths
     assert "/chat/completions" in paths
 
 
 async def test_canned_sse_shape():
-    """Guards the mock's chunk shape against drift from the real OpenAI SSE format."""
+    """The mock stream starts with an assistant role delta and ends with `data: [DONE]`,
+    like a real OpenAI-compatible stream."""
     out = b""
     async for c in canned_sse():
         out += c
@@ -210,9 +210,9 @@ async def test_canned_sse_shape():
 def test_tap_reads_usage_from_a_non_streamed_completion():
     """A client that omits `stream` gets one JSON object, not `data:`-framed events.
 
-    The SSE line parser finds no `data:` prefix anywhere in it, so usage never landed:
-    the request recorded tok=0/0 cost=0.0 and the per-key USD cap did not apply to
-    anyone who left `stream` at its OpenAI default of false.
+    The SSE line parser finds no `data:` prefix anywhere in it, so parsed as SSE, usage
+    never lands: the request records zero tokens and zero cost, and the per-key USD cap
+    does not apply to anyone who leaves `stream` at its OpenAI default of false.
     """
     tap = StreamTap(sse=False)
     tap.feed(json.dumps({
@@ -243,11 +243,10 @@ def test_tap_in_sse_mode_does_not_parse_a_bare_json_body():
 def test_tap_meters_sse_whatever_the_upstream_calls_it():
     """Accounting must not depend on the upstream labelling its stream correctly.
 
-    Mode was taken from `content-type` alone, so an SSE upstream that omits the header —
-    or calls it `application/json` — parsed as neither shape: tok=0/0, model=None, and
-    the request accrued no spend while the client got a perfectly good stream. Omitting
-    it is the regression that matters, because before the tap had a mode at all it always
-    ran the SSE parser and got this right.
+    With the mode taken from `content-type` alone, an SSE upstream that omits the
+    header — or calls it `application/json` — would parse as neither shape: zero tokens
+    and no model name, and the request would accrue no spend while the client got a
+    perfectly good stream.
     """
     from agentgate.proxy.streaming import StreamTap
 
@@ -284,10 +283,9 @@ def test_buffered_tap_never_exceeds_its_cap():
         tap.feed(b"{" + b"x" * (1024 * 1024))
     assert len(tap._buf) <= _MAX_BUFFERED_RESPONSE_BYTES
 
-    # And while the mode is still UNDECIDED, which is where the cap was not enforced at
-    # all: whitespace gives the sniff no first byte to judge on, and the early return
-    # that waits for one skipped the trim, so an upstream sending nothing but whitespace
-    # grew the buffer without bound — past the very cap this test exists to pin.
+    # And while the mode is still UNDECIDED: whitespace gives the sniff no first byte to
+    # judge on, and an early return that waits for one must not skip the trim, or an
+    # upstream sending nothing but whitespace grows the buffer without bound.
     undecided = StreamTap(sse=None)
     for _ in range(12):
         undecided.feed(b" " * (1024 * 1024))
@@ -298,10 +296,11 @@ def test_buffered_tap_never_exceeds_its_cap():
 def test_bom_prefixed_completion_is_not_mistaken_for_sse():
     """A byte-order mark must not cost a request its accounting.
 
-    The shape sniff reads the first non-blank byte, and a BOM is not `{`, so an ordinary
-    JSON completion was parsed as SSE: no `data:` line ever arrived and the request
-    recorded zero tokens. A sender should not emit one (RFC 8259 §8.1) but a parser may
-    ignore it — `json.loads` already does, so the BOM broke nothing except the sniff.
+    The shape sniff reads the first non-blank byte, and a BOM is not `{`, so unless the
+    sniff skips it an ordinary JSON completion parses as SSE: no `data:` line ever
+    arrives and the request records zero tokens. A sender should not emit one (RFC 8259
+    §8.1) but a parser may ignore it — `json.loads` already does, so the sniff is the
+    only place a BOM matters.
     """
     completion = json.dumps({
         "model": "m",

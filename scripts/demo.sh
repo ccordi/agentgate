@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# agentgate zero-key demo: mock upstream + isolated gateway; shows the injection
-# block, the egress deny, and the audit trail. No API keys, no model downloads.
-# In a terminal it pauses after each step (Enter to advance); DEMO_PAUSE=0 runs
-# straight through, and non-interactive runs (CI, pipes) never pause.
+# agentgate demo: a mock model server and gateway show an injection block,
+# an HTTP policy decision and the audit log. No provider API keys or model files needed.
+# Runs without pauses by default. Set DEMO_PAUSE=1 for presentations, then press
+# Enter after each step to continue.
 #
-# Nothing under the repo is written: the audit DB, request bodies and both server
-# logs live in a per-run temp dir, removed on success and kept on failure.
+# The audit database, request bodies and server logs use a temporary directory for each
+# run. It is removed on success and kept on failure.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 GW_PORT="${DEMO_GW_PORT:-4123}"
-MOCK_PORT=4200   # fixed: the mock provider's base_url is hardcoded to :4200 (config.py:75)
+MOCK_PORT=4200   # matches config.py DEFAULT_PROVIDERS["mock"].base_url
 GW="http://127.0.0.1:${GW_PORT}"
 DEMO_TMP="$(mktemp -d "${TMPDIR:-/tmp}/agentgate-demo.XXXXXX")"
 
@@ -23,20 +23,19 @@ else
   BOLD=""; DIM=""; CYAN=""; GREEN=""; RED=""; RESET=""
 fi
 
-# Every demo-critical setting pinned; exported env overrides any developer .env.
+# Export demo settings so they take precedence over .env.
 export AGENTGATE_HOST=127.0.0.1
 export AGENTGATE_PORT="$GW_PORT"
 export AGENTGATE_DEFAULT_PROVIDER=mock
-export AGENTGATE_ROUTING__ENABLED=false          # otherwise the router sends traffic to gemini
+export AGENTGATE_ROUTING__ENABLED=false          # keep requests on the mock provider
 export AGENTGATE_DATABASE_URL="sqlite+aiosqlite:///${DEMO_TMP}/audit.db"
 export AGENTGATE_GUARD_BACKEND=heuristic         # deterministic, no model download
-export AGENTGATE_GUARD_BACKEND_OVERRIDES='{}'
+export AGENTGATE_GUARD_BACKEND_OVERRIDES='{}'    # ignore any per-key scanner choices in .env
 export AGENTGATE_GUARD_OBSERVE_MODE=false        # else step 2 forwards instead of 400
 export AGENTGATE_EGRESS__ALLOWLIST='[]'
 export AGENTGATE_LOCAL_API_KEY=                  # no provider credential: mock only
 export AGENTGATE_ADMIN_TOKEN=agentgate-demo-admin-token
 export AGENTGATE_PDP_TOKEN=agentgate-demo-pdp-token
-export AGENTGATE_CAPTURE_ENABLED=false
 export AGENTGATE_CONTENT_CAPTURE_ENABLED=false   # default is on; off keeps runs identical
 
 MOCK_PID=""
@@ -58,13 +57,11 @@ say() { printf '\n%s=== %s ===%s\n' "${BOLD}${CYAN}" "$*" "$RESET"; }
 ok()  { printf '%s✓ %s%s\n' "$GREEN" "$*" "$RESET"; }
 fatal() { printf '%sFATAL: %s%s\n' "$RED" "$*" "$RESET" >&2; }
 
-# Paced by default: wait for Enter after each step so the output can be read (or
-# presented) step by step. DEMO_PAUSE=0 runs straight through. Reads the terminal
-# directly, so it cannot consume step input; with no terminal attached (CI, piped
-# runs), pauses skip silently.
+# Optional presentation pauses read the terminal directly so they cannot consume
+# step input. With no terminal attached, the read returns immediately.
 pause() {
-  if [ "${DEMO_PAUSE:-1}" = "0" ]; then return 0; fi
-  printf '\n%s-- paused: Enter to continue (DEMO_PAUSE=0 runs straight through) --%s' "$DIM" "$RESET" >&2
+  if [ "${DEMO_PAUSE:-0}" = "0" ]; then return 0; fi
+  printf '\n%s-- paused: Enter to continue (unset DEMO_PAUSE to run straight through) --%s' "$DIM" "$RESET" >&2
   read -r _ </dev/tty 2>/dev/null || true
   printf '\n' >&2
 }
@@ -91,8 +88,7 @@ wait_up() {
   return 1
 }
 
-# Audit writes are fire-and-forget background tasks, so poll the `requests` table
-# rather than sleeping blind. Table and column names are frozen surface.
+# Audit writes run in background tasks. Poll until the expected rows arrive.
 wait_audit_rows() {
   n=0
   for _ in $(seq 1 40); do
@@ -106,7 +102,7 @@ wait_audit_rows() {
 
 # --- preflight: both ports must be free ---
 if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:${MOCK_PORT}/"; then
-  fatal ":${MOCK_PORT} already in use (the mock's fixed port). Leftover bench or demo run? pkill -f bench.mock_upstream"
+  fatal ":${MOCK_PORT} is in use; free the mock model server port before rerunning the demo"
   exit 1
 fi
 if curl -s -o /dev/null --max-time 1 "${GW}/"; then
@@ -114,10 +110,10 @@ if curl -s -o /dev/null --max-time 1 "${GW}/"; then
   exit 1
 fi
 
-say "starting mock upstream (:${MOCK_PORT}) and isolated gateway (:${GW_PORT})"
+say "Start the mock model server (:${MOCK_PORT}) and gateway (:${GW_PORT})"
 uv run python -m bench.mock_upstream >"$DEMO_TMP/mock.log" 2>&1 &
 MOCK_PID=$!
-wait_up "http://127.0.0.1:${MOCK_PORT}/" no "mock upstream" "$DEMO_TMP/mock.log"
+wait_up "http://127.0.0.1:${MOCK_PORT}/" no "mock model server" "$DEMO_TMP/mock.log"
 uv run agentgate >"$DEMO_TMP/gateway.log" 2>&1 &
 GW_PID=$!
 wait_up "${GW}/healthz" yes "gateway" "$DEMO_TMP/gateway.log"
@@ -128,9 +124,9 @@ cat >"$DEMO_TMP/benign.json" <<'JSON'
  "messages": [{"role": "user", "content": "Summarize this article in one sentence."}]}
 JSON
 
-# The tool text trips exactly two heuristic patterns — ignore-previous (0.6) and
-# prompt-exfil (0.6), guards/heuristic.py:19,22 — summing past HARD_THRESHOLD 0.7.
-# One pattern alone maxes at 0.6, so both are needed; do not reword it.
+# The tool text matches ignore-previous and prompt-exfil in guards/heuristic.py
+# _PATTERNS. Their combined weight passes HARD_THRESHOLD; either alone does not.
+# Keep both signals in the payload.
 cat >"$DEMO_TMP/poisoned.json" <<'JSON'
 {"model": "agentgate-demo", "stream": true,
  "stream_options": {"include_usage": true},
@@ -152,25 +148,25 @@ cat >"$DEMO_TMP/egress.json" <<'JSON'
  "context": {"agent_id": "demo"}}
 JSON
 
-say "1/4 benign request -> streams through the mock (HTTP 200, SSE)"
+say "1/4 Send a normal request through the gateway"
 st="$(curl -sS -o "$DEMO_TMP/out1" -w '%{http_code}' -H 'Content-Type: application/json' \
       -H 'Authorization: Bearer demo-key' --data-binary @"$DEMO_TMP/benign.json" \
       "${GW}/a/demo/v1/chat/completions")"
 echo "HTTP ${st}"
-printf '%sfirst SSE chunk (a data: line, shown as JSON):%s\n' "$DIM" "$RESET"
+printf '%sFirst response chunk (JSON from the stream):%s\n' "$DIM" "$RESET"
 sed -n '1s/^data: //p' "$DEMO_TMP/out1" >"$DEMO_TMP/chunk-first.json"
 pp "$DEMO_TMP/chunk-first.json"
 echo "..."
-printf '%sfinal usage chunk:%s\n' "$DIM" "$RESET"
+printf '%sToken usage reported at the end of the stream:%s\n' "$DIM" "$RESET"
 grep 'usage' "$DEMO_TMP/out1" | tail -1 | sed 's/^data: //' >"$DEMO_TMP/chunk-usage.json"
 pp "$DEMO_TMP/chunk-usage.json"
 grep '\[DONE\]' "$DEMO_TMP/out1"
 { [ "$st" = 200 ] && grep -q 'data: \[DONE\]' "$DEMO_TMP/out1"; } \
   || { fatal "benign request did not stream through"; exit 1; }
-ok "streamed through: HTTP 200, incremental SSE, usage chunk, [DONE]"
+ok "HTTP 200: received a complete response stream and token usage"
 pause
 
-say "2/4 same request + poisoned trailing role:\"tool\" message -> blocked (HTTP 400)"
+say "2/4 Send a request with an injected instruction in a tool result"
 st="$(curl -sS -o "$DEMO_TMP/out2" -w '%{http_code}' -H 'Content-Type: application/json' \
       -H 'Authorization: Bearer demo-key' --data-binary @"$DEMO_TMP/poisoned.json" \
       "${GW}/a/demo/v1/chat/completions")"
@@ -178,31 +174,29 @@ echo "HTTP ${st}"
 pp "$DEMO_TMP/out2"
 { [ "$st" = 400 ] && grep -q 'injection_blocked' "$DEMO_TMP/out2"; } \
   || { fatal "poisoned tool output was not blocked"; exit 1; }
-ok "blocked before forwarding: HTTP 400, type=injection_blocked"
+ok "HTTP 400: injection blocked before the request reached the model server"
 pause
 
-say "3/4 egress PDP: fake AWS key headed to a non-allowlisted host -> deny"
+say "3/4 Ask the gateway about an upload containing a fake AWS key"
 curl -sS -o "$DEMO_TMP/out3" -H 'Content-Type: application/json' \
      -H "Authorization: Bearer ${AGENTGATE_PDP_TOKEN}" \
      --data-binary @"$DEMO_TMP/egress.json" "${GW}/a/egress/decision"
 pp "$DEMO_TMP/out3"
 { grep -q '"decision":"deny"' "$DEMO_TMP/out3" && grep -q 'aws_access_key' "$DEMO_TMP/out3"; } \
-  || { fatal "egress PDP did not deny"; exit 1; }
-ok "denied: decision=deny naming aws_access_key — the outbound request never happened"
+  || { fatal "policy check did not deny the upload"; exit 1; }
+ok "Upload denied by the policy check; no request was sent to the destination"
 pause
 
-say "4/4 audit trail (agentgate audit tail)"
+say "4/4 Read the audit log (agentgate audit tail)"
 wait_audit_rows 3
 uv run agentgate audit tail -n 10
-ok "3 audit rows: allow (200) / injection block (400) / egress deny (403)"
+ok "3 records: successful model request (200), injection block (400), denied HTTP policy check (403)"
 pause
 
-say "what was real here"
+say "About this demo"
 cat <<'NOTE'
-The upstream was bench/mock_upstream.py — a canned SSE mock, no real model, no keys.
-Everything that fired above is real gateway code on the real request path:
-the injection block (step 2) and the egress deny (step 3) are deterministic
-pattern/policy decisions that do not depend on any model. The mock replaces only
-the LLM's answer, never the safety verdicts or the audit trail.
+The demo used fixed responses from a mock model server and the built-in heuristic scanner.
+The upload step only requested a policy decision; it did not run the HTTP tool
+or send data to the destination. No model files or provider API keys were needed.
 NOTE
 printf '%sdemo complete.%s\n' "${BOLD}${GREEN}" "$RESET"

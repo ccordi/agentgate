@@ -1,9 +1,8 @@
-"""Tier-3 egress PEP — `safe_http_request` policy-client tests.
+"""Egress PEP — `safe_http_request` policy-client tests.
 
 All hermetic: the PDP and the outbound request are both `httpx.MockTransport`s,
-no live gateway/network/MCP runtime required. One smoke test against a running
-gateway is included, marked `live` — it is deselected unless you ask for it
-(`uv run pytest -m live`).
+no live gateway/network/MCP runtime required. One optional live test, run only with
+`pytest -m live`, checks a gateway running on :4100 and skips if none is.
 
 Covers PEP responsibilities and fail-closed behaviour: PDP unreachable,
 timeout, non-2xx, and malformed response all deny without executing the outbound.
@@ -194,13 +193,13 @@ def test_pdp_missing_decision_field_fails_closed():
 def test_pre_pdp_failure_fails_closed_instead_of_raising():
     """A failure before the PDP is consulted must be an explicit deny, not a raise.
 
-    httpx.InvalidURL is not an HTTPError subclass, so a malformed PDP URL escaped the
-    transport handlers and reached the MCP shell, whose broad catch reports "egress
-    permitted by policy, but the outbound request failed" — a lie for a request the PDP
-    never saw. Nothing egressed, but telling the model policy permitted it invites a
-    retry on another path. The pre-PDP guard converts every pre-verdict failure into
-    `fail-closed:pep-error`, which is what makes the shell's carry-note true by
-    construction.
+    httpx.InvalidURL is not an HTTPError subclass, so without the guard a malformed PDP
+    URL would escape the transport handlers and reach the MCP shell, whose broad catch
+    reports "egress permitted by policy, but the outbound request failed" — a lie for a
+    request the PDP never saw. Nothing egresses, but telling the model policy permitted
+    it invites a retry on another path. The pre-PDP guard converts every pre-verdict
+    failure into `fail-closed:pep-error`, which is what makes the shell's "permitted by
+    policy" note true by construction.
     """
     result = safe_http_request(
         url="https://api.internal.example/data",
@@ -235,10 +234,16 @@ def test_bearer_token_forwarded_to_pdp():
     assert seen["auth"] == "Bearer secret-token"
 
 
-# ---- optional live smoke against a running gateway -----------------------------------
+# ---- optional live test against :4100 ------------------------------------------------
 
 def _pdp_token_from_env_file() -> str | None:
-    """Return the deployed PDP bearer from the working-tree `.env`, if present."""
+    """The live gateway's PDP bearer, from the working-tree `.env` file.
+
+    The file, not the process environment: the hermetic conftest fixture strips every
+    AGENTGATE_* variable so unit tests can't inherit deployment state — correct for
+    everything except this test, whose entire point is to meet the deployment. The
+    line is read as a plain `NAME=value`.
+    """
     try:
         with open(".env") as f:
             for line in f:
@@ -252,22 +257,85 @@ def _pdp_token_from_env_file() -> str | None:
 
 @pytest.mark.live
 def test_live_smoke_against_real_gateway():
-    """Live smoke against a running gateway. Marked `live` — CI never runs `-m live`;
-    run it with `uv run pytest -m live` while a gateway is up on :4100."""
+    """Optional live test: hits the real `:4100` gateway if it's up. Skips cleanly
+    (does not fail) if the gateway is unreachable or there is no token to speak with.
+
+    Two things it must get right:
+
+    - The probe authenticates: a healthy, *enforcing* gateway 401s a probe without a
+      bearer, and skipping on that would report the gateway as down precisely because the
+      auth works. A 401 with the `.env` token is a real failure (token drift), not a skip.
+    - The gateway's own origin is carved out of the loopback allowance, so the PDP must
+      **deny** `http://127.0.0.1:4100/healthz` — asserted below as the feature it is. A
+      throwaway local server on another port carries the allow-and-execute leg that
+      loopback still grants.
+    """
     bearer = _pdp_token_from_env_file()
     if bearer is None:
         pytest.skip("no AGENTGATE_PDP_TOKEN in ./.env to smoke with")
 
-    gw_base = "http://127.0.0.1:4100"
-    # Use the gateway's own healthz as the egress target: loopback is always
-    # allowlisted, so the PDP should `allow`, and the outbound GET succeeds.
-    result = safe_http_request(
-        url=f"{gw_base}/healthz",
+    probe_payload = {
+        "tool_name": "safe_http_request",
+        "tool_kind": "network",
+        "arguments": {"url": "http://127.0.0.1:4100/healthz", "method": "GET"},
+    }
+    try:
+        probe = httpx.post(
+            "http://127.0.0.1:4100/a/egress/decision",
+            json=probe_payload,
+            headers={"authorization": f"Bearer {bearer}"},
+            timeout=1.0,
+        )
+    except httpx.HTTPError:
+        pytest.skip("agentgate :4100 not reachable")
+
+    if probe.status_code == 404:
+        pytest.skip("agentgate :4100 running without the /a/egress/decision route")
+    # 401 with the .env token is NOT a skip: the deployment and its own .env disagree.
+    assert probe.status_code == 200, (
+        f"PDP rejected the .env bearer ({probe.status_code}) — token drift between "
+        "the running gateway and ./.env"
+    )
+
+    # Leg 1: the gateway's own origin is denied.
+    denied = safe_http_request(
+        url="http://127.0.0.1:4100/healthz",
         method="GET",
         bearer=bearer,
     )
+    assert denied.decision == "deny"
+    assert denied.policy == "gateway-self-egress"
+    assert denied.executed is False
 
-    assert result.decision == "allow"
-    assert result.executed is True
-    assert result.outbound is not None
-    assert result.outbound.status_code == 200
+    # Leg 2: loopback that is NOT the gateway is still allowed, and executes.
+    import http.server
+    import threading
+
+    class _Ok(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 — BaseHTTPRequestHandler's contract
+            self.send_response(200)
+            self.send_header("content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):  # keep pytest output clean
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Ok)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        allowed = safe_http_request(
+            url=f"http://127.0.0.1:{port}/",
+            method="GET",
+            bearer=bearer,
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=2.0)
+
+    assert allowed.decision == "allow"
+    assert allowed.executed is True
+    assert allowed.outbound is not None
+    assert allowed.outbound.status_code == 200

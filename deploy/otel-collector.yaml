@@ -1,0 +1,29 @@
+# OTel collector for the tracing stack (compose profile `otel`).
+# One traces pipeline, dual-exported: Tempo for viewing, and a JSONL file as a
+# durable record that does not depend on Tempo's storage or API.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+  batch: {}
+
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  file:
+    path: /export/spans.jsonl
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/tempo, file]

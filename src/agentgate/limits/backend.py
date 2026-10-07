@@ -3,7 +3,7 @@
 Two implementations behind one interface:
 
 - ``RedisBackend`` — the real path; counters persist across restarts and processes.
-- ``MemoryBackend`` — in-process fallback for single-process deployments without
+- ``MemoryBackend`` — in-process fallback so a single-user deployment works without
   Docker/Redis. Used automatically when Redis can't be reached at startup.
 
 The interface is the minimum the limiters need: an atomic float increment with TTL,
@@ -15,6 +15,8 @@ from __future__ import annotations
 import logging
 import time
 from typing import Protocol
+
+from agentgate.redaction import mask_url_password
 
 log = logging.getLogger("agentgate.limits")
 
@@ -101,15 +103,29 @@ class RedisBackend:
         await self._r.delete(key)
 
 
-async def make_backend(redis_url: str) -> CounterBackend:
-    """Try Redis; fall back to in-process memory if it's unreachable."""
+async def make_backend(redis_url: str, *, require: bool = False) -> CounterBackend:
+    """Try Redis; fall back to in-process memory if it's unreachable.
+
+    With ``require=True`` the fallback is refused and startup fails instead: in a
+    multi-replica deployment, per-process counters would give every replica its own
+    spend cap and kill switch, which is worse than not starting.
+
+    The URL is masked wherever it is reported — `redis://user:pw@host` is an ordinary
+    spelling, and both the success line and the refusal are read by more people than the
+    config is. The client still connects with the URL as configured.
+    """
     try:
         import redis.asyncio as aioredis
 
         client = aioredis.from_url(redis_url, decode_responses=True)
         await client.ping()
-        log.info("limits backend: redis (%s)", redis_url)
+        log.info("limits backend: redis (%s)", mask_url_password(redis_url))
         return RedisBackend(client)
     except Exception as exc:  # noqa: BLE001
+        if require:
+            raise RuntimeError(
+                f"AGENTGATE_REQUIRE_SHARED_LIMITS is set and redis is unreachable "
+                f"({mask_url_password(redis_url)}): {exc}"
+            ) from exc
         log.warning("redis unavailable (%s); using in-process memory backend", exc)
         return MemoryBackend()

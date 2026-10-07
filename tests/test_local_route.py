@@ -1,7 +1,7 @@
 """Unit tests for the local-route adapter.
 
-These paths were only reachable through the endpoint before; the warning branch
-(instructions detected, regex didn't match) wasn't reachable at all.
+Drives the adapter directly, including the warning branch (instructions detected,
+regex didn't match).
 """
 
 from __future__ import annotations

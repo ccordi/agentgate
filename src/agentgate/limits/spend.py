@@ -1,10 +1,11 @@
 """Spend cap + runaway kill switch (provider-aware).
 
-Guards against runaway agent loops. Two enforcement modes:
+Protects a deployment from runaway agent loops. Two enforcement modes:
 
-- **Cloud** routes accrue an estimated USD spend in a rolling window; crossing the
-  cap **trips the kill switch** for that key (a sticky stop, not just a one-request
-  rejection — a runaway loop should be halted, not throttled).
+- **Cloud** routes accrue an estimated USD spend in a fixed window that starts at the
+  key's first request; crossing the cap **trips the kill switch** for that key (a sticky
+  stop, not just a one-request rejection — a runaway loop should be halted, not
+  throttled).
 - **Local** routes accrue a request count in the window (a rate/compute guard);
   no dollars, so the guard is request volume.
 
@@ -35,9 +36,14 @@ class SpendExceeded(Exception):
 
 @dataclass
 class SpendConfig:
+    """Caps for one key, built from Settings at startup."""
+
     cloud_usd_cap: float = 5.0  # per window, per key
     local_request_cap: int = 10_000  # per window, per key
-    window_s: int = 3600  # rolling window length
+    # FIXED window, not rolling: the counter's TTL is set only on the first write (NX,
+    # backend.py RedisBackend.incr / MemoryBackend), so the window starts at the first
+    # request and expires whole rather than sliding.
+    window_s: int = 3600
     kill_ttl_s: int | None = None  # None = sticky until manually cleared
 
 
@@ -51,6 +57,12 @@ class SpendTracker:
     def __init__(self, backend: CounterBackend, config: SpendConfig | None = None) -> None:
         self._b = backend
         self.cfg = config or SpendConfig()
+
+    @property
+    def backend_kind(self) -> str:
+        """Which counter backend is live — `make_backend` silently falls back to memory
+        when Redis is unreachable, and /readyz is where that becomes visible."""
+        return type(self._b).__name__
 
     def _spend_key(self, key_id: str) -> str:
         return f"spend:usd:{key_id}"

@@ -11,9 +11,7 @@ from agentgate.audit.store import AuditStore, RequestAudit, utcnow
 def make_audit(**overrides) -> RequestAudit:
     """A complete, unremarkable `RequestAudit`; override what a test cares about.
 
-    One definition because `RequestAudit` keeps growing columns (`injection_hard`,
-    `guard_backend`): a per-file copy means every new field is a multi-file edit,
-    and copies that start identical drift apart silently.
+    Shared so every test builds audit rows the same way.
     """
     base = dict(
         ts=utcnow(), agent_id="a1", key_id=None, model_requested="gemini-3-flash",
@@ -41,3 +39,22 @@ async def wait_for_audit_row(
             return rows[0]
         await asyncio.sleep(delay)
     return None
+
+
+async def wait_for_audit_rows(
+    store: AuditStore, n: int, *, tries: int = 40, delay: float = 0.02
+) -> list[RequestRecord]:
+    """Poll until at least ``n`` rows have landed; return them newest-first.
+
+    `wait_for_audit_row` answers as soon as *any* row exists, which is the wrong
+    question for a test that drives several requests in sequence and wants the row
+    for the latest one. Returns what it found on timeout, so the caller's assertion
+    fails on the row, not on a helper.
+    """
+    rows: list[RequestRecord] = []
+    for _ in range(tries):
+        rows = await store.fetch_requests(limit=n)
+        if len(rows) >= n:
+            return rows
+        await asyncio.sleep(delay)
+    return rows

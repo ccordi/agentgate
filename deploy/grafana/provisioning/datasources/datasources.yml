@@ -1,0 +1,17 @@
+# Adds Prometheus (obs profile) and Tempo (otel profile) as data sources, so Grafana
+# needs no manual setup. Tempo queries fail unless the otel profile is running.
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # Prometheus lives in the gateway service's network namespace (see the compose
+    # file), so its API answers on the gateway's service name, not its own.
+    url: http://agentgate:9090
+    uid: prometheus
+    isDefault: true
+  - name: Tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    uid: tempo

@@ -1,0 +1,25 @@
+# The sidebar: groups of pages, in order. A group's heading is shown above its pages.
+- heading: Design and results
+  pages:
+    - title: Write-up
+      url: /
+    - title: Threat model
+      url: /threat-model.html
+    - title: Results
+      url: /results.html
+    - title: Concurrency
+      url: /scale-design.html
+- heading: Guides
+  pages:
+    - title: Getting started
+      url: /getting-started.html
+    - title: Docker
+      url: /docker.html
+    - title: OpenCode
+      url: /opencode.html
+    - title: Configuration
+      url: /configuration.html
+    - title: Audit log
+      url: /audit.html
+    - title: LiteLLM
+      url: /litellm-plugin.html

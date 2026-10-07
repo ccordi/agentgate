@@ -3,8 +3,11 @@
 Covers `guards.resolve_backend` / `guards.scan`'s per-key dispatch:
 - guard_backend_overrides routes a key to its mapped backend; unmapped keys fall
   back to the global default.
-- DeBERTa unavailability changes only the current key's resolved backend.
-- "combined" still composes both scans, and degrades to "llm" when deberta is absent.
+- the resolved backend is always the configured one. Resolution has no availability
+  input to degrade on: a process whose configured backend needs a model it cannot
+  load refuses to start (`app.lifespan`), and a model that dies *after* boot is a 503
+  `guard_unavailable`, never a quietly weaker scan.
+- "combined" composes both scans, and fails closed when either half cannot run.
 - Settings validation fails fast on an unrecognized backend in guard_backend or
   guard_backend_overrides.
 """
@@ -19,9 +22,9 @@ from agentgate.guards import Verdict, deberta, local_llm
 from tests.support import make_settings
 
 
-async def _scan(settings, messages, key_id, *, deberta_available):
+async def _scan(settings, messages, key_id):
     """What the pipeline does: resolve the backend for this key, then scan with it."""
-    backend = guards.resolve_backend(settings, key_id, deberta_available)
+    backend = guards.resolve_backend(settings, key_id)
     return await guards.scan(backend, messages)
 
 
@@ -49,7 +52,7 @@ def _settings(**overrides) -> Settings:
     )
 
 
-# The driver owns extraction now, so mocks patch `scan_text` (per text), not a
+# The driver owns extraction, so mocks patch `scan_text` (per text), not a
 # per-request scanner.
 def _recorder(monkeypatch, module, calls: list) -> None:
     """Patch ``module.scan_text`` with a clean-verdict stub that records each call."""
@@ -83,36 +86,47 @@ async def test_mapped_keys_route_to_their_backend(monkeypatch):
     _recorder(monkeypatch, deberta, deberta_calls)
     _recorder(monkeypatch, local_llm, llm_calls)
 
-    await _scan(settings, MESSAGES, KEY_DEBERTA, deberta_available=True)
+    await _scan(settings, MESSAGES, KEY_DEBERTA)
     assert deberta_calls and not llm_calls
 
     deberta_calls.clear()
-    await _scan(settings, MESSAGES, KEY_LLM, deberta_available=True)
+    await _scan(settings, MESSAGES, KEY_LLM)
     assert not deberta_calls and llm_calls
 
     # Unmapped key falls back to the global default ("heuristic") -> neither mock called.
     llm_calls.clear()
-    verdict = await _scan(settings, MESSAGES, "unmapped-key", deberta_available=True)
+    verdict = await _scan(settings, MESSAGES, "unmapped-key")
     assert not deberta_calls and not llm_calls
-    assert verdict == Verdict.clean()
+    # Clean, but over a surface that was actually examined. Not `== Verdict.clean()`:
+    # that would also assert scanned_items == 0 — i.e. pass for a request the guard
+    # never looked at, the exact distinction the field exists to make. Assert both
+    # halves separately.
+    assert (verdict.flagged, verdict.score, verdict.hard) == (False, 0.0, False)
+    assert verdict.scanned_items == 2  # the heuristic scanned the tool batch + user turn
 
 
-async def test_deberta_absent_falls_back_per_request_without_clobbering_other_keys(monkeypatch):
-    """A DeBERTa fallback for one key does not change another key's LLM route."""
+async def test_a_model_that_cannot_run_refuses_rather_than_degrades(monkeypatch):
+    """A deberta-mapped key whose model fails at scan time gets a refusal, not a
+    heuristic verdict wearing deberta's name in the audit row.
+
+    Degrading that key to `heuristic` for the request would hide the failure. A missing
+    model is a refused start, and a model that dies after boot is `GuardUnavailable` → 503 —
+    either way the operator finds out, and it stays that one key's problem."""
     settings = _settings()
     llm_calls = []
-    deberta_calls = []
-    _recorder(monkeypatch, deberta, deberta_calls)
     _recorder(monkeypatch, local_llm, llm_calls)
 
-    # deberta-mapped key, deberta unavailable -> falls back to heuristic (no deberta call).
-    verdict = await _scan(settings, MESSAGES, KEY_DEBERTA, deberta_available=False)
-    assert deberta_calls == []
-    assert verdict == Verdict.clean()  # heuristic on a benign message
+    def boom(text):
+        raise RuntimeError("onnxruntime session gone")
 
-    # llm-mapped key is unaffected by the other key's fallback.
-    await _scan(settings, MESSAGES, KEY_LLM, deberta_available=False)
-    assert deberta_calls == []
+    monkeypatch.setattr(deberta, "scan_text", boom)
+
+    with pytest.raises(guards.GuardUnavailable) as exc:
+        await _scan(settings, MESSAGES, KEY_DEBERTA)
+    assert exc.value.backend == "deberta"
+
+    # The llm-mapped key scans normally through the same process.
+    await _scan(settings, MESSAGES, KEY_LLM)
     assert llm_calls
 
 
@@ -122,7 +136,7 @@ async def test_combined_composes_both_backends(monkeypatch):
     _mock_deberta(monkeypatch, flagged=True)
     _mock_llm(monkeypatch, flagged=False)
 
-    verdict = await _scan(settings, MESSAGES, KEY_COMBINED, deberta_available=True)
+    verdict = await _scan(settings, MESSAGES, KEY_COMBINED)
 
     assert verdict.flagged
     assert verdict.score == 0.9
@@ -130,35 +144,41 @@ async def test_combined_composes_both_backends(monkeypatch):
     assert verdict.hard
 
 
-async def test_combined_falls_back_to_llm_when_deberta_absent(monkeypatch):
-    """combined -> llm when deberta is unavailable; the deberta backend is never called."""
+async def test_combined_fails_closed_when_a_half_cannot_run(monkeypatch):
+    """`combined` does not drop to `llm` alone when deberta is unavailable: half a
+    composition is a different control, and running it under the name `combined` is the
+    silent downgrade this posture exists to prevent."""
     settings = _settings()
-    deberta_calls = []
-    _recorder(monkeypatch, deberta, deberta_calls)
-    _mock_llm(monkeypatch, flagged=True)
+    _mock_llm(monkeypatch, flagged=False)
 
-    verdict = await _scan(settings, MESSAGES, KEY_COMBINED, deberta_available=False)
+    def boom(text):
+        raise RuntimeError("onnxruntime session gone")
 
-    assert deberta_calls == []
-    assert verdict.flagged
-    assert verdict.reasons == ["tool_output:llm_flag"]
+    monkeypatch.setattr(deberta, "scan_text", boom)
+
+    with pytest.raises(guards.GuardUnavailable) as exc:
+        await _scan(settings, MESSAGES, KEY_COMBINED)
+    assert exc.value.backend == "combined"
 
 
-def test_resolve_guard_backend_matches_dispatch():
-    """_resolve_guard_backend (used for audit) mirrors _scan_request's resolution,
-    including the deberta-availability fallback."""
+def test_resolved_backend_is_always_the_configured_one():
+    """Resolution is override-else-default and nothing more, so the backend the audit row
+    records is the one the operator configured — for every key, mapped or not."""
     settings = _settings()
 
-    assert guards.resolve_backend(settings, KEY_DEBERTA, deberta_available=True) == "deberta"
-    assert guards.resolve_backend(settings, KEY_LLM, deberta_available=True) == "llm"
-    assert guards.resolve_backend(settings, KEY_COMBINED, deberta_available=True) == "combined"
-    assert guards.resolve_backend(settings, "unmapped-key", deberta_available=True) == "heuristic"
+    assert guards.resolve_backend(settings, KEY_DEBERTA) == "deberta"
+    assert guards.resolve_backend(settings, KEY_LLM) == "llm"
+    assert guards.resolve_backend(settings, KEY_COMBINED) == "combined"
+    assert guards.resolve_backend(settings, "unmapped-key") == "heuristic"
+    assert guards.resolve_backend(settings, None) == "heuristic"
 
-    # Fallbacks when deberta is absent.
-    assert guards.resolve_backend(settings, KEY_DEBERTA, deberta_available=False) == "heuristic"
-    assert guards.resolve_backend(settings, KEY_COMBINED, deberta_available=False) == "llm"
-    # llm-mapped key is unaffected.
-    assert guards.resolve_backend(settings, KEY_LLM, deberta_available=False) == "llm"
+    # A deberta default resolves to deberta for every key without an override of its own.
+    # There is no availability argument for a caller to weaken that with: startup
+    # guarantees the model is loaded, or the process is not running.
+    deberta_default = make_settings(guard_backend="deberta",
+                                    guard_backend_overrides={KEY_LLM: "llm"})
+    assert guards.resolve_backend(deberta_default, "unmapped-key") == "deberta"
+    assert guards.resolve_backend(deberta_default, KEY_LLM) == "llm"
 
 
 def test_unknown_backend_in_guard_backend_fails_fast():

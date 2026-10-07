@@ -1,14 +1,15 @@
-"""HTTP face of the tier-3 egress PDP: `POST /a/egress/decision`.
+"""HTTP face of the egress PDP: `POST /a/egress/decision`.
 
-Advisory endpoint, not on the model path. The harness's PreToolUse hook (the PEP,
-implemented in `egress/mcp_server.py`) POSTs a tool call here before executing it; this
-returns allow/deny.
+Advisory endpoint, not on the model path. The PEP (`egress/pep.py`, offered to agents as an
+MCP tool by `egress/mcp_server.py`) POSTs a tool call here before executing it; this returns
+allow/deny.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hmac
+import logging
 import uuid
 
 from fastapi import APIRouter, HTTPException, Request
@@ -17,7 +18,10 @@ from pydantic import BaseModel, Field
 from agentgate.audit.store import AuditStore, RequestAudit, utcnow
 from agentgate.egress import policy
 from agentgate.limits.spend import key_id_from_auth
+from agentgate.observability import metrics
 from agentgate.tasks import spawn_background
+
+log = logging.getLogger("agentgate.egress")
 
 router = APIRouter()
 
@@ -42,22 +46,23 @@ class EgressDecisionResponse(BaseModel):
 
 
 def _check_egress_auth(request: Request, settings) -> None:
-    """Mandatory bearer auth for the PDP: `Authorization: Bearer <AGENTGATE_PDP_TOKEN>`.
-    Startup refuses to serve without the token (`validate_runtime_settings`); the unset
+    """Mandatory bearer auth for the egress PDP: `Authorization: Bearer <AGENTGATE_PDP_TOKEN>`.
+    Startup refuses to serve without the token (validate_runtime_settings); the unset
     branch here fails closed (503) as defense in depth for app objects assembled without
     lifespan.
 
     The auth map, stated plainly: the admin routes require AGENTGATE_ADMIN_TOKEN; this
     endpoint requires its own dedicated AGENTGATE_PDP_TOKEN (NOT the local upstream's
-    `local_api_key` — one value must not span two trust boundaries); the proxy routes are
-    unauthenticated by design — a transparent proxy does not own the Authorization slot,
-    so their inbound auth is the loopback bind itself, enforced at startup.
+    `local_api_key` — one value must not span two trust boundaries); by default the proxy
+    routes need no gateway credential (issued keys are opt-in) — a transparent proxy does
+    not own the Authorization slot, so their inbound auth is the loopback bind itself,
+    enforced at startup.
 
     What this token buys: not defense against the agent (the PEP holds it by
     construction — `egress/mcp_server.py`) but against everything else that can reach
-    loopback, above all browser-borne requests probing the PDP as a policy oracle —
-    "would you allow this payload to that host?" maps the allowlist and the classifier's
-    edges without tripping a denial on the real path."""
+    loopback: browser-borne requests (CSRF / DNS rebinding) probing the PDP as a policy
+    oracle — "would you allow this payload to that host?" maps the allowlist and the
+    classifier's edges without tripping a denial on the real path."""
     expected = settings.pdp_token
     if not expected:
         raise HTTPException(status_code=503, detail="PDP token not configured")
@@ -80,11 +85,10 @@ async def egress_decision(
 
     _check_egress_auth(request, settings)
 
-    # Off the event loop. The classification window is 1 MB and the detection patterns are
-    # linear, so a worst-case payload costs ~2 s of pure CPU — inline, that is 2 s in which
-    # this process answers nothing at all, for every key sharing the gateway, on a decision
-    # that runs once per egress tool call. Same reason `guards`, `capture` and the startup
-    # warmup already hand their CPU-bound work to a thread.
+    # Off the event loop. The payload is classified over a window of up to 1 MB (its cost
+    # is noted at `policy._MAX_PAYLOAD_CHARS`); inline, that time would stall every
+    # request this process is serving. Same reason `guards` hands its CPU-bound work to a
+    # thread.
     verdict = await asyncio.to_thread(
         policy.evaluate,
         tool_name=payload.tool_name,
@@ -92,9 +96,17 @@ async def egress_decision(
         tool_kind=payload.tool_kind,
         allowlist=settings.egress.allowlist,
         private_repo_markers=settings.private_repo_markers,
+        # The loopback allowance must not cover the gateway's own control plane.
+        gateway_origin=(settings.host, settings.port),
     )
 
     audit_id = uuid.uuid4()
+    if verdict.caveats:
+        # One caveat kind exists on this path (the payload window); counted and logged
+        # here rather than in the pure policy function, keyed by the audit id.
+        metrics.scan_truncated_total.labels("egress_payload").inc()
+        log.info("egress payload classification truncated at %d chars: audit_id=%s "
+                 "decision=%s", policy._MAX_PAYLOAD_CHARS, audit_id, verdict.decision)
     context = payload.context or {}
     sensitivity_class = str(verdict.sensitivity) if verdict.sensitivity is not None else None
     spawn_background(audit_store.write(RequestAudit(
@@ -117,6 +129,7 @@ async def egress_decision(
         tool_call_count=1,
         finish_reason=verdict.decision,
         status=200 if verdict.decision != "deny" else 403,
+        caveats=verdict.caveats or None,
     )))
 
     conditions = EgressConditions(**verdict.conditions) if verdict.conditions else None

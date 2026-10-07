@@ -4,7 +4,7 @@ Kept out of `conftest.py` so tests can import these directly (a plain function i
 easier to reason about than a fixture when only one test needs it).
 """
 
-from tests.support.audit import make_audit, wait_for_audit_row
+from tests.support.audit import make_audit, wait_for_audit_row, wait_for_audit_rows
 from tests.support.fixtures import (
     FAKE_EMAIL,
     FAKE_OPENAI_KEY,
@@ -25,4 +25,5 @@ __all__ = [
     "make_settings",
     "sse_handler",
     "wait_for_audit_row",
+    "wait_for_audit_rows",
 ]

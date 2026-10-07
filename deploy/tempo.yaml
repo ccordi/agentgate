@@ -1,0 +1,25 @@
+# Tempo single-binary config for the tracing stack (compose profile `otel`).
+# Local storage in the tempo-data volume; ingest is OTLP/gRPC from the collector
+# (container network only — no host port). Retention is short: Tempo is the viewer,
+# the exported JSONL is the durable artifact.
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/traces
+    wal:
+      path: /var/tempo/wal
+
+compactor:
+  compaction:
+    block_retention: 168h

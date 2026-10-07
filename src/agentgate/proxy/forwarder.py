@@ -27,11 +27,8 @@ from agentgate.proxy.streaming import StreamResult, StreamTap
 # `proxy-authorization` is the client's own proxy credential and has no business reaching
 # a model provider.
 #
-# `content-encoding` is not here because it is already gone by this point: `new_call`
-# decompresses the body and pops the header off the request it hands us, and rejects the
-# request outright when it cannot decode what the header declares. So there is never a
-# compressed body to describe here — a static entry would be stripping a header that the
-# only bodies reaching this function do not carry.
+# `content-encoding` is absent: `new_call` decompresses the body and drops the header, or
+# rejects the request (see `pipeline._decompress_body`).
 _STRIP_REQUEST_HEADERS = {
     "host", "content-length", "accept-encoding",
     # RFC 7230 §6.1 hop-by-hop
@@ -58,10 +55,15 @@ def build_upstream_url(provider: Provider) -> str:
 def prepare_headers(inbound: dict[str, str], provider: Provider) -> dict[str, str]:
     """Pass auth through unchanged; drop hop-by-hop headers.
 
-    Auth is a plain header (`x-goog-api-key` or `Authorization: Bearer`) with no
-    signing, so a straight copy is correct. When the provider specifies an api_key
-    override (local servers that require a Bearer token), inject it and strip the
-    inbound Gemini key.
+    Checked: auth is a plain header (`x-goog-api-key` or `Authorization:
+    Bearer`) with no signing — so a straight copy is correct. When the provider
+    specifies an api_key override (local servers that require Bearer but don't
+    validate the value), inject it and strip the inbound Gemini key.
+
+    Pass-through assumes the inbound credential is the upstream's own. When issued
+    keys are required it is a gateway-minted key instead, and the pipeline has
+    already rejected any non-local provider without an api_key to inject
+    (`screen_upstream_credentials`) — a minted key never leaves the gateway.
     """
     out = {k: v for k, v in inbound.items() if k.lower() not in _STRIP_REQUEST_HEADERS}
     if provider.api_key is not None:
@@ -92,13 +94,13 @@ async def forward_stream(
     ) as resp:
         # Everything is piped through the tap, streamed or not. A client that omits
         # `stream` — which is OpenAI's default — gets a single JSON completion back, and
-        # the SSE line parser finds no `data:` prefix in it, so usage never lands and the
-        # request accrues zero spend.
+        # an SSE line parser alone would find no `data:` prefix in it, so usage would never
+        # land and the request would accrue zero spend.
         content_type = (resp.headers.get("content-type") or "").lower()
         # A declared SSE stream is taken at its word; anything else — including no header
-        # at all — is decided from the first bytes. Trusting the header alone made the
-        # accounting depend on it: an upstream that streams SSE without saying so, or
-        # labels it `application/json`, metered nothing and accrued no spend.
+        # at all — is decided from the first bytes. Trusting the header alone would make
+        # the accounting depend on it: an upstream that streams SSE without saying so, or
+        # labels it `application/json`, would meter nothing and accrue no spend.
         tap = StreamTap(sse=True if "text/event-stream" in content_type else None)
         out_headers = {
             k: v for k, v in resp.headers.items() if k.lower() not in _STRIP_RESPONSE_HEADERS

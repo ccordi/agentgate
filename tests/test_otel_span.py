@@ -9,7 +9,9 @@ from __future__ import annotations
 import pytest
 
 from agentgate.observability import otel
-from tests.support import HARD_INJECTION, wait_for_audit_row
+from agentgate.tasks import drain_background
+from tests.support import HARD_INJECTION
+from tests.support.audit import wait_for_audit_row
 
 STREAMING = {"stream": True, "stream_options": {"include_usage": True}}
 AUTH = {"authorization": "Bearer t"}
@@ -17,7 +19,7 @@ AUTH = {"authorization": "Bearer t"}
 MARKER = "the moss on the north face of the seawall"
 
 
-def test_seam_is_a_noop_when_tracing_is_inactive(monkeypatch):
+def test_tracing_calls_do_nothing_when_tracing_is_inactive(monkeypatch):
     monkeypatch.setattr(otel, "_ACTIVE", False)
     assert otel.capture_parent() is None
     otel.record_chat(None, model="m", duration_ms=12.0, attributes={"agentgate.status": 200})
@@ -91,10 +93,7 @@ async def test_blocked_request_emits_span_with_the_verdict(gateway, span_exporte
         headers=AUTH,
     )
     assert r.status_code == 400
-    # The rejected-path span is emitted just before the audit write in the same spawned
-    # task, so the row appearing means the span has too.
-    row = await wait_for_audit_row(gateway.store)
-    assert row is not None
+    await drain_background()  # the rejected-path span is emitted from a spawned task
 
     chats = [s for s in span_exporter.get_finished_spans() if s.name == "chat m"]
     assert len(chats) == 1
@@ -105,3 +104,23 @@ async def test_blocked_request_emits_span_with_the_verdict(gateway, span_exporte
     for s in span_exporter.get_finished_spans():
         for key, value in (s.attributes or {}).items():
             assert HARD_INJECTION not in str(value), (s.name, key)
+
+
+async def test_rejected_row_id_is_the_request_id(gateway, span_exporter):
+    """A rejected request's audit row keys by the request's own id, like the completion path.
+
+    If the rejected path did not pass ``row_id``, blocked and rejected requests would get
+    a fresh id, and their audit rows could not be joined to their spans or content samples.
+    """
+    r = await gateway.client.post(
+        "/v1/chat/completions",
+        json={"model": "m", "messages": [{"role": "user", "content": HARD_INJECTION}], **STREAMING},
+        headers=AUTH,
+    )
+    assert r.status_code == 400
+    await drain_background()
+
+    chats = [s for s in span_exporter.get_finished_spans() if s.name == "chat m"]
+    row = await wait_for_audit_row(gateway.store)
+    assert row is not None and row.status == 400
+    assert str(row.id) == chats[0].attributes["agentgate.request_id"]

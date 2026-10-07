@@ -98,13 +98,14 @@ async def cmd_tail(args, store: AuditStore) -> None:
     if not rows:
         print("no matching requests")
         return
-    fmt = "{:<8} {:<8} {:<10} {:<8} {:<14} {:<6} {:<7} {:<6} {:<4} {:>8}"
+    fmt = "{:<8} {:<8} {:<10} {:<8} {:<14} {:<6} {:<7} {:<7} {:<4} {:>8}"
     print(fmt.format("TIME", "ID", "AGENT", "PROVIDER", "MODEL", "STATUS",
                      "SENS", "INJ", "RED", "COST"))
     for r in rows:
         inj = "-"
         if r.injection_score is not None:
-            inj = f"{r.injection_score:.2f}" + ("!" if r.injection_hard else "")
+            # Four decimals, to show a score against the classifier's 0.995; "!" marks a block.
+            inj = f"{r.injection_score:.4f}" + ("!" if r.injection_hard else "")
         print(fmt.format(
             _as_utc(r.ts).astimezone().strftime("%H:%M:%S") if r.ts else "-",
             str(r.id)[:8],
@@ -189,7 +190,8 @@ def build_parser() -> argparse.ArgumentParser:
     tail.add_argument("-n", type=int, default=20, help="how many rows (default 20)")
     tail.add_argument("--agent", default=None, help="only this agent_id")
     tail.add_argument("--flagged", action="store_true",
-                      help="only rows the injection guard or tool inspector flagged")
+                      help="only requests flagged by the prompt-injection scanner or with "
+                           "a suspicious tool description or name")
 
     stats = sub.add_parser("stats", help="aggregate counts")
     stats.add_argument("--since", default=None, metavar="Nh|Nd",
